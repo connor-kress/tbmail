@@ -47,10 +47,12 @@ class TbmailTestCase(unittest.TestCase):
                     # Thunderbird message index records the current state.
                     b"X-Mozilla-Status: 0001\n",
                     b"Message-ID: <unread@example.com>\n",
-                    b"Date: Sat, 22 Aug 2026 10:00:00 -0400\n",
+                    # Match the next message's date to exercise deterministic
+                    # tie-breaking during paginated searches.
+                    b"Date: Sun, 23 Aug 2026 11:00:00 -0400\n",
                     b"From: Sender One <sender@example.com>\n",
                     b"To: Person <person@example.com>\n",
-                    b"Subject: Unread example\n",
+                    b"Subject: Pending example\n",
                     b"Content-Type: text/plain; charset=utf-8\n",
                     b"\n",
                     b"This is the unread body.\n",
@@ -160,7 +162,7 @@ class TbmailTestCase(unittest.TestCase):
 
         self.assertEqual(len(search_result["messages"]), 1)
         summary = search_result["messages"][0]
-        self.assertEqual(summary["subject"], "Unread example")
+        self.assertEqual(summary["subject"], "Pending example")
         self.assertFalse(summary["read"])
 
         show_result = run(self.parse("show", summary["id"]))
@@ -183,6 +185,22 @@ class TbmailTestCase(unittest.TestCase):
         self.assertEqual(len(result["messages"]), 1)
         self.assertEqual(result["messages"][0]["subject"], "Read example")
         self.assertTrue(result["messages"][0]["read"])
+
+    def test_search_supports_deterministic_index_offset(self) -> None:
+        all_messages = run(self.parse("search"))
+        first_page = run(self.parse("search", "--limit", "1"))
+        second_page = run(self.parse("search", "--limit", "1", "--offset", "1"))
+
+        self.assertEqual(
+            [message["subject"] for message in all_messages["messages"]],
+            ["Read example", "Pending example"],
+        )
+        self.assertEqual(first_page["messages"][0]["subject"], "Read example")
+        self.assertEqual(second_page["messages"][0]["subject"], "Pending example")
+
+    def test_search_rejects_negative_offset(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--offset must be nonnegative"):
+            run(self.parse("search", "--offset", "-1"))
 
 
 if __name__ == "__main__":

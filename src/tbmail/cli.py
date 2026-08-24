@@ -66,7 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--subject", help="subject text")
     search.add_argument("--unread", action="store_true", help="only unread messages")
     search.add_argument("--since", metavar="YYYY-MM-DD", help="earliest message date")
-    search.add_argument("--limit", type=int, default=20, help="maximum results")
+    search.add_argument("--limit", type=int, help="maximum results")
+    search.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="number of sorted results to skip (default: 0)",
+    )
 
     show = subparsers.add_parser("show", help="display a message returned by search")
     show.add_argument("message_id", help="tbmail message ID")
@@ -147,8 +153,10 @@ def run(args: argparse.Namespace) -> object:
             "folders": results,
         }
 
-    if args.limit < 1 or args.limit > 1000:
+    if args.limit is not None and (args.limit < 1 or args.limit > 1000):
         raise ValueError("--limit must be between 1 and 1000")
+    if args.offset < 0:
+        raise ValueError("--offset must be nonnegative")
     since_epoch = parse_since(args.since) if args.since else None
     messages = search_messages(
         accounts_and_folders,
@@ -159,6 +167,7 @@ def run(args: argparse.Namespace) -> object:
         unread=args.unread,
         since_epoch=since_epoch,
         limit=args.limit,
+        offset=args.offset,
     )
     return {
         "messages": [

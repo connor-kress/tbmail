@@ -362,7 +362,8 @@ def search_messages(
     subject: str | None,
     unread: bool,
     since_epoch: int | None,
-    limit: int,
+    limit: int | None,
+    offset: int,
     cache_path: Path | None = None,
 ) -> list[IndexedMessage]:
     cache = cache_path or default_cache_path()
@@ -395,15 +396,19 @@ def search_messages(
     if since_epoch is not None:
         clauses.append("date_epoch >= ?")
         parameters.append(since_epoch)
-    parameters.append(limit)
+    parameters.extend([limit if limit is not None else -1, offset])
 
     with closing(_connect(cache)) as connection:
         rows = connection.execute(
             f"""
             SELECT * FROM messages
             WHERE {" AND ".join(clauses)}
-            ORDER BY COALESCE(date_epoch, 0) DESC
-            LIMIT ?
+            ORDER BY COALESCE(date_epoch, 0) DESC,
+                     account_email ASC,
+                     folder_path ASC,
+                     offset DESC,
+                     public_id ASC
+            LIMIT ? OFFSET ?
             """,
             parameters,
         ).fetchall()

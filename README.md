@@ -24,7 +24,8 @@ uv run tbmail accounts
 uv run tbmail count --account all
 uv run tbmail count -a personal
 uv run tbmail count --account-raw me@example.com
-uv run tbmail search -a personal --unread --limit 20
+uv run tbmail search -a personal --unread
+uv run tbmail search -a personal --unread --limit 100 --offset 200
 uv run tbmail search -a work --from example@sender.com
 uv run tbmail show MESSAGE_ID
 ```
@@ -34,6 +35,9 @@ load another file:
 
 `--account` and `--account-raw` are mutually exclusive. Both flags can be
 repeated. If neither is given, `count` and `search` use all configured accounts.
+Search returns every match unless `--limit` is set. `--offset` skips that many
+results in the deterministic search order, so `--limit` and `--offset` can
+split a search into index-based batches.
 
 ```console
 uv run tbmail --config /path/to/config.toml accounts
