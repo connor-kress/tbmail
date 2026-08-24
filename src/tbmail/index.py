@@ -354,7 +354,7 @@ def sync_read_state(
             )
 
 
-def search_messages(
+def _prepare_search(
     accounts_and_folders: list[tuple[MailAccount, Path]],
     profile: Path,
     query: str | None,
@@ -362,10 +362,8 @@ def search_messages(
     subject: str | None,
     unread: bool,
     since_epoch: int | None,
-    limit: int | None,
-    offset: int,
     cache_path: Path | None = None,
-) -> list[IndexedMessage]:
+) -> tuple[Path, str, list[object]]:
     cache = cache_path or default_cache_path()
     for account, folder in accounts_and_folders:
         ensure_indexed(account, folder, cache)
@@ -396,13 +394,65 @@ def search_messages(
     if since_epoch is not None:
         clauses.append("date_epoch >= ?")
         parameters.append(since_epoch)
+    return cache, " AND ".join(clauses), parameters
+
+
+def count_messages(
+    accounts_and_folders: list[tuple[MailAccount, Path]],
+    profile: Path,
+    query: str | None,
+    sender: str | None,
+    subject: str | None,
+    unread: bool,
+    since_epoch: int | None,
+    cache_path: Path | None = None,
+) -> int:
+    cache, where, parameters = _prepare_search(
+        accounts_and_folders,
+        profile,
+        query,
+        sender,
+        subject,
+        unread,
+        since_epoch,
+        cache_path,
+    )
+    with closing(_connect(cache)) as connection:
+        row = connection.execute(
+            f"SELECT COUNT(*) FROM messages WHERE {where}", parameters
+        ).fetchone()
+    return int(row[0])
+
+
+def search_messages(
+    accounts_and_folders: list[tuple[MailAccount, Path]],
+    profile: Path,
+    query: str | None,
+    sender: str | None,
+    subject: str | None,
+    unread: bool,
+    since_epoch: int | None,
+    limit: int | None,
+    offset: int,
+    cache_path: Path | None = None,
+) -> list[IndexedMessage]:
+    cache, where, parameters = _prepare_search(
+        accounts_and_folders,
+        profile,
+        query,
+        sender,
+        subject,
+        unread,
+        since_epoch,
+        cache_path,
+    )
     parameters.extend([limit if limit is not None else -1, offset])
 
     with closing(_connect(cache)) as connection:
         rows = connection.execute(
             f"""
             SELECT * FROM messages
-            WHERE {" AND ".join(clauses)}
+            WHERE {where}
             ORDER BY COALESCE(date_epoch, 0) DESC,
                      account_email ASC,
                      folder_path ASC,

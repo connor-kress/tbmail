@@ -148,9 +148,9 @@ class TbmailTestCase(unittest.TestCase):
                 default_config_path(), config_home / "tbmail" / "config.toml"
             )
 
-    def test_count_supports_alias_and_raw_address(self) -> None:
-        alias_result = run(self.parse("count", "-a", "personal"))
-        raw_result = run(self.parse("count", "--account-raw", "person@example.com"))
+    def test_status_supports_alias_and_raw_address(self) -> None:
+        alias_result = run(self.parse("status", "-a", "personal"))
+        raw_result = run(self.parse("status", "--account-raw", "person@example.com"))
 
         self.assertEqual(alias_result["folders"][0]["unread"], 1)
         self.assertEqual(raw_result["folders"][0]["total"], 2)
@@ -201,6 +201,28 @@ class TbmailTestCase(unittest.TestCase):
     def test_search_rejects_negative_offset(self) -> None:
         with self.assertRaisesRegex(ValueError, "--offset must be nonnegative"):
             run(self.parse("search", "--offset", "-1"))
+
+    def test_search_count_uses_search_filters(self) -> None:
+        result = run(
+            self.parse(
+                "search",
+                "--unread",
+                "--subject",
+                "Pending example",
+                "--count",
+            )
+        )
+
+        self.assertEqual(result, {"count": 1})
+
+    def test_search_count_rejects_pagination(self) -> None:
+        for pagination in (("--limit", "1"), ("--offset", "0")):
+            with self.subTest(pagination=pagination):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "--count cannot be combined with --limit or --offset",
+                ):
+                    run(self.parse("search", "--count", *pagination))
 
 
 if __name__ == "__main__":

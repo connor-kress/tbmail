@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .config import ConfigError, load_config
 from .index import (
+    count_messages,
     find_message,
     parse_since,
     read_message,
@@ -52,9 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("accounts", help="list discovered IMAP accounts")
 
-    count = subparsers.add_parser("count", help="show folder message counts")
-    _account_arguments(count)
-    count.add_argument("--folder", default="inbox", help="folder name (default: inbox)")
+    status = subparsers.add_parser("status", help="show folder message status")
+    _account_arguments(status)
+    status.add_argument(
+        "--folder", default="inbox", help="folder name (default: inbox)"
+    )
 
     search = subparsers.add_parser("search", help="search downloaded message headers")
     _account_arguments(search)
@@ -66,11 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--subject", help="subject text")
     search.add_argument("--unread", action="store_true", help="only unread messages")
     search.add_argument("--since", metavar="YYYY-MM-DD", help="earliest message date")
+    search.add_argument(
+        "--count", action="store_true", help="return the number of matching messages"
+    )
     search.add_argument("--limit", type=int, help="maximum results")
     search.add_argument(
         "--offset",
         type=int,
-        default=0,
+        default=None,
         help="number of sorted results to skip (default: 0)",
     )
 
@@ -134,7 +140,7 @@ def run(args: argparse.Namespace) -> object:
         (account, resolve_folder(account, args.folder)) for account in selected
     ]
 
-    if args.command == "count":
+    if args.command == "status":
         cache_mtime = (profile / "folderCache.json").stat().st_mtime
         results = []
         for account, folder in accounts_and_folders:
@@ -153,21 +159,28 @@ def run(args: argparse.Namespace) -> object:
             "folders": results,
         }
 
+    if args.count and (args.limit is not None or args.offset is not None):
+        raise ValueError("--count cannot be combined with --limit or --offset")
     if args.limit is not None and (args.limit < 1 or args.limit > 1000):
         raise ValueError("--limit must be between 1 and 1000")
-    if args.offset < 0:
+    if args.offset is not None and args.offset < 0:
         raise ValueError("--offset must be nonnegative")
     since_epoch = parse_since(args.since) if args.since else None
+    search_arguments = {
+        "accounts_and_folders": accounts_and_folders,
+        "profile": profile,
+        "query": args.query,
+        "sender": args.sender,
+        "subject": args.subject,
+        "unread": args.unread,
+        "since_epoch": since_epoch,
+    }
+    if args.count:
+        return {"count": count_messages(**search_arguments)}
     messages = search_messages(
-        accounts_and_folders,
-        profile=profile,
-        query=args.query,
-        sender=args.sender,
-        subject=args.subject,
-        unread=args.unread,
-        since_epoch=since_epoch,
+        **search_arguments,
         limit=args.limit,
-        offset=args.offset,
+        offset=args.offset or 0,
     )
     return {
         "messages": [
