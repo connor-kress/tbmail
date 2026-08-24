@@ -85,6 +85,8 @@ def _connect(path: Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS messages_location
             ON messages(account_email, folder_path, date_epoch DESC);
+        CREATE INDEX IF NOT EXISTS messages_message_id
+            ON messages(account_email, folder_path, message_id);
         """
     )
     version = connection.execute(
