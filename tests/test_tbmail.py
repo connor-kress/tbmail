@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tbmail.cli import build_parser, run
+from tbmail.config import default_config_path
 
 
 class TbmailTestCase(unittest.TestCase):
@@ -134,6 +135,16 @@ class TbmailTestCase(unittest.TestCase):
 
         self.assertEqual(result["accounts"][0]["alias"], "personal")
         self.assertEqual(result["accounts"][0]["email"], "person@example.com")
+
+    def test_default_config_uses_xdg_config_home(self) -> None:
+        config_home = self.root / "xdg-config"
+        with patch.dict(
+            os.environ,
+            {"XDG_CONFIG_HOME": str(config_home), "TBMAIL_CONFIG": ""},
+        ):
+            self.assertEqual(
+                default_config_path(), config_home / "tbmail" / "config.toml"
+            )
 
     def test_count_supports_alias_and_raw_address(self) -> None:
         alias_result = run(self.parse("count", "-a", "personal"))

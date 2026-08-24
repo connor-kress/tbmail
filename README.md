@@ -8,34 +8,35 @@ It does not connect to mail servers or modify Thunderbird data.
 
 ## Setup
 
-Create `~/.config/tbmail/config.toml`:
+Create `~/.config/tbmail/config.toml` with aliases for the accounts in your
+Thunderbird profile:
 
 ```toml
 [accounts]
-school = "ckress@ufl.edu"
-personal = "ckress04@gmail.com"
-personal-old = "con2coool@gmail.com"
+personal = "me@example.com"
+work = "me@work.example"
 ```
 
-Run the project with `uv`:
+Run the project through `uv`:
 
 ```console
 uv run tbmail accounts
 uv run tbmail count --account all
 uv run tbmail count -a personal
-uv run tbmail count --account-raw ckress04@gmail.com
+uv run tbmail count --account-raw me@example.com
 uv run tbmail search -a personal --unread --limit 20
-uv run tbmail search -a school --from example@sender.com
+uv run tbmail search -a work --from example@sender.com
 uv run tbmail show MESSAGE_ID
 ```
+
+The CLI respects `XDG_CONFIG_HOME`. Use `--config` before the subcommand to
+load another file:
 
 `--account` and `--account-raw` are mutually exclusive. Both flags can be
 repeated. If neither is given, `count` and `search` use all configured accounts.
 
-Global options such as `--config` and `--profile` go before the subcommand:
-
 ```console
-uv run tbmail --config ./config.toml accounts
+uv run tbmail --config /path/to/config.toml accounts
 ```
 
 ## Data sources
