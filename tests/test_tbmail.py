@@ -1,0 +1,178 @@
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from pathlib import Path
+from unittest.mock import patch
+
+from tbmail.cli import build_parser, run
+
+
+class TbmailTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.profile = self.root / "profile"
+        self.mail_directory = self.profile / "ImapMail" / "imap.example.com"
+        self.mail_directory.mkdir(parents=True)
+        self.config = self.root / "config.toml"
+        self.config.write_text(
+            '[accounts]\npersonal = "person@example.com"\n', encoding="utf-8"
+        )
+        (self.profile / "prefs.js").write_text(
+            "\n".join(
+                [
+                    'user_pref("mail.accountmanager.accounts", "account1");',
+                    'user_pref("mail.account.account1.server", "server1");',
+                    'user_pref("mail.server.server1.type", "imap");',
+                    'user_pref("mail.server.server1.userName", "person@example.com");',
+                    'user_pref("mail.server.server1.hostname", "imap.example.com");',
+                    'user_pref("mail.server.server1.directory-rel", '
+                    '"[ProfD]ImapMail/imap.example.com");',
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self.inbox = self.mail_directory / "INBOX"
+        self.inbox.write_bytes(
+            b"".join(
+                [
+                    b"From - Sat Aug 22 10:00:00 2026\n",
+                    # IMAP mbox status headers can remain read while the
+                    # Thunderbird message index records the current state.
+                    b"X-Mozilla-Status: 0001\n",
+                    b"Message-ID: <unread@example.com>\n",
+                    b"Date: Sat, 22 Aug 2026 10:00:00 -0400\n",
+                    b"From: Sender One <sender@example.com>\n",
+                    b"To: Person <person@example.com>\n",
+                    b"Subject: Unread example\n",
+                    b"Content-Type: text/plain; charset=utf-8\n",
+                    b"\n",
+                    b"This is the unread body.\n",
+                    b"From - Sun Aug 23 11:00:00 2026\n",
+                    b"X-Mozilla-Status: 0001\n",
+                    b"Message-ID: <read@example.com>\n",
+                    b"Date: Sun, 23 Aug 2026 11:00:00 -0400\n",
+                    b"From: Sender Two <other@example.com>\n",
+                    b"To: Person <person@example.com>\n",
+                    b"Subject: Read example\n",
+                    b"Content-Type: text/plain; charset=utf-8\n",
+                    b"\n",
+                    b"This is the read body.\n",
+                ]
+            )
+        )
+        (self.profile / "folderCache.json").write_text(
+            json.dumps(
+                {
+                    "/old/profile/ImapMail/imap.example.com/INBOX.msf": {
+                        "totalMsgs": 2,
+                        "totalUnreadMsgs": 1,
+                        "serverTotal": 2,
+                        "serverUnseen": 1,
+                        "lastSyncTimeInSec": 1787497200,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        with closing(
+            sqlite3.connect(self.profile / "global-messages-db.sqlite")
+        ) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE folderLocations (
+                    id INTEGER PRIMARY KEY,
+                    folderURI TEXT NOT NULL
+                );
+                CREATE TABLE messages (
+                    folderID INTEGER NOT NULL,
+                    headerMessageID TEXT,
+                    jsonAttributes TEXT,
+                    deleted INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE attributeDefinitions (
+                    id INTEGER PRIMARY KEY,
+                    extensionName TEXT NOT NULL,
+                    name TEXT NOT NULL
+                );
+                INSERT INTO attributeDefinitions(id, extensionName, name)
+                VALUES (59, 'built-in', 'read');
+                INSERT INTO folderLocations(id, folderURI)
+                VALUES (
+                    1,
+                    'imap://person%40example.com@imap.example.com/INBOX'
+                );
+                INSERT INTO messages(folderID, headerMessageID, jsonAttributes)
+                VALUES
+                    (1, 'unread@example.com', '{"59": false}'),
+                    (1, 'read@example.com', '{"59": true}');
+                """
+            )
+        self.parser = build_parser()
+        self.environment = patch.dict(
+            os.environ,
+            {"XDG_CACHE_HOME": str(self.root / "cache")},
+        )
+        self.environment.start()
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+        self.temporary_directory.cleanup()
+
+    def parse(self, *arguments: str):
+        return self.parser.parse_args(
+            ["--config", str(self.config), "--profile", str(self.profile), *arguments]
+        )
+
+    def test_accounts_lists_alias(self) -> None:
+        result = run(self.parse("accounts"))
+
+        self.assertEqual(result["accounts"][0]["alias"], "personal")
+        self.assertEqual(result["accounts"][0]["email"], "person@example.com")
+
+    def test_count_supports_alias_and_raw_address(self) -> None:
+        alias_result = run(self.parse("count", "-a", "personal"))
+        raw_result = run(self.parse("count", "--account-raw", "person@example.com"))
+
+        self.assertEqual(alias_result["folders"][0]["unread"], 1)
+        self.assertEqual(raw_result["folders"][0]["total"], 2)
+
+    def test_search_and_show_downloaded_message(self) -> None:
+        search_result = run(
+            self.parse("search", "-a", "personal", "--unread", "Sender")
+        )
+
+        self.assertEqual(len(search_result["messages"]), 1)
+        summary = search_result["messages"][0]
+        self.assertEqual(summary["subject"], "Unread example")
+        self.assertFalse(summary["read"])
+
+        show_result = run(self.parse("show", summary["id"]))
+        self.assertEqual(show_result["account"], "personal")
+        self.assertEqual(show_result["body"], "This is the unread body.\n")
+
+    def test_search_filters_subject_and_date(self) -> None:
+        result = run(
+            self.parse(
+                "search",
+                "--account-raw",
+                "person@example.com",
+                "--subject",
+                "Read example",
+                "--since",
+                "2026-08-23",
+            )
+        )
+
+        self.assertEqual(len(result["messages"]), 1)
+        self.assertEqual(result["messages"][0]["subject"], "Read example")
+        self.assertTrue(result["messages"][0]["read"])
+
+
+if __name__ == "__main__":
+    unittest.main()

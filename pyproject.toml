@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tbmail"
+version = "0.1.0"
+description = "Read-only CLI for locally downloaded Thunderbird mail"
+requires-python = ">=3.11"
+
+[project.scripts]
+tbmail = "tbmail.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
