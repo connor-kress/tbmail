@@ -186,6 +186,43 @@ class TbmailTestCase(unittest.TestCase):
         self.assertEqual(result["messages"][0]["subject"], "Read example")
         self.assertTrue(result["messages"][0]["read"])
 
+    def test_search_uses_mbox_read_state_before_gloda_indexes_account(self) -> None:
+        contents = self.inbox.read_bytes()
+        self.inbox.write_bytes(
+            contents.replace(b"X-Mozilla-Status: 0001", b"X-Mozilla-Status: 0000", 1)
+        )
+        with closing(
+            sqlite3.connect(self.profile / "global-messages-db.sqlite")
+        ) as connection:
+            connection.execute("DELETE FROM messages")
+
+        result = run(self.parse("search", "-a", "personal", "--unread"))
+
+        self.assertEqual(
+            [message["subject"] for message in result["messages"]],
+            ["Pending example"],
+        )
+
+    def test_search_indexes_new_account_reusing_cached_mailbox(self) -> None:
+        run(self.parse("search", "-a", "personal"))
+        self.config.write_text(
+            '[accounts]\nnew = "new@example.com"\n', encoding="utf-8"
+        )
+        prefs = (self.profile / "prefs.js").read_text(encoding="utf-8")
+        (self.profile / "prefs.js").write_text(
+            prefs.replace("person@example.com", "new@example.com"), encoding="utf-8"
+        )
+
+        result = run(self.parse("search", "-a", "new"))
+
+        self.assertEqual(
+            [message["subject"] for message in result["messages"]],
+            ["Read example", "Pending example"],
+        )
+        self.assertTrue(
+            all(message["account"] == "new" for message in result["messages"])
+        )
+
     def test_search_supports_deterministic_index_offset(self) -> None:
         all_messages = run(self.parse("search"))
         first_page = run(self.parse("search", "--limit", "1"))

@@ -16,8 +16,6 @@ from urllib.parse import quote
 
 from .profile import MailAccount
 
-SCHEMA_VERSION = 2
-
 
 def default_cache_path() -> Path:
     cache_home = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
@@ -60,12 +58,9 @@ def _connect(path: Path) -> sqlite3.Connection:
     connection.executescript(
         """
         PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS mailboxes (
             path TEXT PRIMARY KEY,
+            account_email TEXT NOT NULL,
             size INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL
         );
@@ -88,15 +83,6 @@ def _connect(path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS messages_message_id
             ON messages(account_email, folder_path, message_id);
         """
-    )
-    version = connection.execute(
-        "SELECT value FROM metadata WHERE key = 'schema_version'"
-    ).fetchone()
-    if version and int(version["value"]) != SCHEMA_VERSION:
-        connection.executescript("DELETE FROM messages; DELETE FROM mailboxes;")
-    connection.execute(
-        "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
-        (str(SCHEMA_VERSION),),
     )
     connection.commit()
     return connection
@@ -252,10 +238,12 @@ def ensure_indexed(
     stat = folder.stat()
     with closing(_connect(cache)) as connection:
         current = connection.execute(
-            "SELECT size, mtime_ns FROM mailboxes WHERE path = ?", (str(folder),)
+            "SELECT account_email, size, mtime_ns FROM mailboxes WHERE path = ?",
+            (str(folder),),
         ).fetchone()
         if (
             current
+            and current["account_email"] == account.email.casefold()
             and current["size"] == stat.st_size
             and current["mtime_ns"] == stat.st_mtime_ns
         ):
@@ -283,9 +271,14 @@ def ensure_indexed(
                 records,
             )
             connection.execute(
-                "INSERT OR REPLACE INTO mailboxes(path, size, mtime_ns) "
-                "VALUES(?, ?, ?)",
-                (str(folder), stat.st_size, stat.st_mtime_ns),
+                "INSERT OR REPLACE INTO mailboxes"
+                "(path, account_email, size, mtime_ns) VALUES(?, ?, ?, ?)",
+                (
+                    str(folder),
+                    account.email.casefold(),
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                ),
             )
 
 
@@ -306,30 +299,35 @@ def sync_read_state(
         f"imap://{quote(account.email, safe='')}@{account.hostname}/{encoded_folder}"
     )
 
-    try:
-        with closing(
-            sqlite3.connect(f"{gloda_path.as_uri()}?mode=ro", uri=True)
-        ) as gloda:
-            attribute = gloda.execute(
-                """
-                SELECT id FROM attributeDefinitions
-                WHERE extensionName = 'built-in' AND name = 'read'
-                """
-            ).fetchone()
-            if not attribute:
-                return
-            read_key = f'$."{attribute[0]}"'
-            rows = gloda.execute(
-                """
-                SELECT m.headerMessageID,
-                       json_extract(m.jsonAttributes, ?) AS is_read
-                FROM messages AS m
-                JOIN folderLocations AS f ON f.id = m.folderID
-                WHERE f.folderURI = ? AND m.deleted = 0
-                """,
-                (read_key, folder_uri),
-            ).fetchall()
-    except sqlite3.OperationalError:
+    rows = None
+    for query in ("mode=ro", "mode=ro&immutable=1"):
+        try:
+            with closing(
+                sqlite3.connect(f"{gloda_path.as_uri()}?{query}", uri=True)
+            ) as gloda:
+                attribute = gloda.execute(
+                    """
+                    SELECT id FROM attributeDefinitions
+                    WHERE extensionName = 'built-in' AND name = 'read'
+                    """
+                ).fetchone()
+                if not attribute:
+                    return
+                read_key = f'$."{attribute[0]}"'
+                rows = gloda.execute(
+                    """
+                    SELECT m.headerMessageID,
+                           json_extract(m.jsonAttributes, ?) AS is_read
+                    FROM messages AS m
+                    JOIN folderLocations AS f ON f.id = m.folderID
+                    WHERE f.folderURI = ? AND m.deleted = 0
+                    """,
+                    (read_key, folder_uri),
+                ).fetchall()
+            break
+        except sqlite3.OperationalError:
+            continue
+    if rows is None:
         return
 
     updates = [
@@ -340,11 +338,6 @@ def sync_read_state(
     cache = cache_path or default_cache_path()
     with closing(_connect(cache)) as connection:
         with connection:
-            connection.execute(
-                "UPDATE messages SET is_read = NULL "
-                "WHERE account_email = ? AND folder_path = ?",
-                (account.email.casefold(), str(folder)),
-            )
             connection.executemany(
                 """
                 UPDATE messages SET is_read = ?
