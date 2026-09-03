@@ -1,12 +1,8 @@
 # tbmail agent instructions
 
-Read `LOCAL.md` when it exists. It contains optional machine-specific setup
-details and is intentionally excluded from Git. Do not assume those details
-apply on another machine.
+Read `LOCAL.md` when it exists. It contains optional machine-specific setup details and is intentionally excluded from Git. Do not assume those details apply on another machine.
 
-When changing an API or CLI, update every affected document, example, and
-locally configured integration described by `LOCAL.md`, including agent skills
-and their descriptions.
+When changing an API or CLI, update every affected document, example, and locally configured integration described by `LOCAL.md`, including agent skills and their descriptions.
 
 After changing Python code, run:
 
