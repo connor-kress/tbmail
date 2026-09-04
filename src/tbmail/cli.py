@@ -246,27 +246,26 @@ def run(args: argparse.Namespace) -> CommandResult:
         raise ValueError("--offset must be nonnegative")
     since_epoch = parse_since(args.since) if args.since else None
     if args.count:
-        return CountResult(
-            count=count_messages(
-                accounts_and_folders,
-                profile,
-                args.query,
-                args.sender,
-                args.subject,
-                args.unread,
-                since_epoch,
-            )
+        count = count_messages(
+            accounts_and_folders,
+            profile=profile,
+            query=args.query,
+            sender=args.sender,
+            subject=args.subject,
+            unread=args.unread,
+            since_epoch=since_epoch,
         )
+        return CountResult(count)
     messages = search_messages(
         accounts_and_folders,
-        profile,
-        args.query,
-        args.sender,
-        args.subject,
-        args.unread,
-        since_epoch,
-        args.limit,
-        args.offset or 0,
+        profile=profile,
+        query=args.query,
+        sender=args.sender,
+        subject=args.subject,
+        unread=args.unread,
+        since_epoch=since_epoch,
+        limit=args.limit,
+        offset=args.offset or 0,
     )
     return SearchResult(
         messages=[
