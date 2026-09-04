@@ -4,7 +4,7 @@ import hashlib
 import os
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from email import policy
 from email.message import Message
@@ -36,6 +36,41 @@ class IndexedMessage:
     date: str | None
     date_epoch: int | None
     is_read: bool | None
+
+
+@dataclass
+class MessageHeaders:
+    message_id: str | None
+    subject: str
+    sender: str
+    recipients: str
+    date: str | None
+    date_epoch: int | None
+    is_read: bool | None
+
+
+@dataclass
+class Attachment:
+    filename: str | None
+    content_type: str
+    size: int | None
+
+
+@dataclass
+class MessageContent:
+    public_id: str = field(metadata={"json_name": "id"})
+    account: str
+    folder: str
+    message_id: str | None
+    subject: str
+    sender: str = field(metadata={"json_name": "from"})
+    recipients: str = field(metadata={"json_name": "to"})
+    date: str | None
+    is_read: bool | None = field(metadata={"json_name": "read"})
+    body_type: str | None
+    body: str
+    body_truncated: bool
+    attachments: list[Attachment]
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -128,9 +163,7 @@ def _public_id(
     return hashlib.sha256(identity).hexdigest()[:24]
 
 
-def _parse_headers(
-    account: MailAccount, folder: Path, header_bytes: bytes
-) -> dict[str, object]:
+def _parse_headers(header_bytes: bytes) -> MessageHeaders:
     message = BytesHeaderParser(policy=policy.default).parsebytes(header_bytes)
     subject = _header_text(message, "Subject")
     sender = _header_text(message, "From")
@@ -150,19 +183,19 @@ def _parse_headers(
         is_read: bool | None = bool(int(status, 16) & 0x0001) if status else None
     except ValueError:
         is_read = None
-    return {
-        "message_id": message_id or None,
-        "subject": subject,
-        "sender": sender,
-        "recipients": recipients,
-        "date": date or None,
-        "date_epoch": _date_epoch(date),
-        "is_read": None if is_read is None else int(is_read),
-    }
+    return MessageHeaders(
+        message_id=message_id or None,
+        subject=subject,
+        sender=sender,
+        recipients=recipients,
+        date=date or None,
+        date_epoch=_date_epoch(date),
+        is_read=is_read,
+    )
 
 
-def _scan_mbox(account: MailAccount, folder: Path) -> list[tuple[object, ...]]:
-    records: list[tuple[object, ...]] = []
+def _scan_mbox(account: MailAccount, folder: Path) -> list[IndexedMessage]:
+    records: list[IndexedMessage] = []
     with folder.open("rb") as mailbox:
         message_start: int | None = None
         header_lines: list[bytes] = []
@@ -174,7 +207,7 @@ def _scan_mbox(account: MailAccount, folder: Path) -> list[tuple[object, ...]]:
             if not line:
                 end = mailbox.tell()
                 if message_start is not None:
-                    headers = _parse_headers(account, folder, b"".join(header_lines))
+                    headers = _parse_headers(b"".join(header_lines))
                     records.append(
                         _record(account, folder, message_start, end, headers)
                     )
@@ -182,7 +215,7 @@ def _scan_mbox(account: MailAccount, folder: Path) -> list[tuple[object, ...]]:
 
             if line.startswith(b"From "):
                 if message_start is not None:
-                    headers = _parse_headers(account, folder, b"".join(header_lines))
+                    headers = _parse_headers(b"".join(header_lines))
                     records.append(
                         _record(account, folder, message_start, line_start, headers)
                     )
@@ -205,29 +238,46 @@ def _record(
     folder: Path,
     start: int,
     end: int,
-    headers: dict[str, object],
-) -> tuple[object, ...]:
-    return (
-        _public_id(
+    headers: MessageHeaders,
+) -> IndexedMessage:
+    return IndexedMessage(
+        public_id=_public_id(
             account,
             folder,
-            str(headers["message_id"] or ""),
-            str(headers["date"] or ""),
-            str(headers["subject"]),
-            str(headers["sender"]),
+            headers.message_id or "",
+            headers.date or "",
+            headers.subject,
+            headers.sender,
             start,
         ),
-        account.email.casefold(),
-        str(folder),
-        start,
-        end - start,
-        headers["message_id"],
-        headers["subject"],
-        headers["sender"],
-        headers["recipients"],
-        headers["date"],
-        headers["date_epoch"],
-        headers["is_read"],
+        account_email=account.email.casefold(),
+        folder_path=folder,
+        offset=start,
+        size=end - start,
+        message_id=headers.message_id,
+        subject=headers.subject,
+        sender=headers.sender,
+        recipients=headers.recipients,
+        date=headers.date,
+        date_epoch=headers.date_epoch,
+        is_read=headers.is_read,
+    )
+
+
+def _message_record(message: IndexedMessage) -> tuple[object, ...]:
+    return (
+        message.public_id,
+        message.account_email,
+        str(message.folder_path),
+        message.offset,
+        message.size,
+        message.message_id,
+        message.subject,
+        message.sender,
+        message.recipients,
+        message.date,
+        message.date_epoch,
+        message.is_read,
     )
 
 
@@ -268,7 +318,7 @@ def ensure_indexed(
                     is_read
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                records,
+                (_message_record(message) for message in records),
             )
             connection.execute(
                 "INSERT OR REPLACE INTO mailboxes"
@@ -517,7 +567,7 @@ def refresh_message(
     return find_message(message.public_id, cache_path)
 
 
-def read_message(message: IndexedMessage, max_body_chars: int) -> dict[str, object]:
+def read_message(message: IndexedMessage, max_body_chars: int) -> MessageContent:
     with message.folder_path.open("rb") as mailbox:
         mailbox.seek(message.offset)
         raw_message = mailbox.read(message.size)
@@ -530,7 +580,7 @@ def read_message(message: IndexedMessage, max_body_chars: int) -> dict[str, obje
 
     body = ""
     body_type: str | None = None
-    attachments: list[dict[str, object]] = []
+    attachments: list[Attachment] = []
     parts = parsed.walk() if parsed.is_multipart() else [parsed]
     html_body = ""
     for part in parts:
@@ -541,11 +591,11 @@ def read_message(message: IndexedMessage, max_body_chars: int) -> dict[str, obje
         if content_disposition == "attachment" or filename:
             payload = part.get_payload(decode=True)
             attachments.append(
-                {
-                    "filename": filename,
-                    "content_type": part.get_content_type(),
-                    "size": len(payload) if isinstance(payload, bytes) else None,
-                }
+                Attachment(
+                    filename=filename,
+                    content_type=part.get_content_type(),
+                    size=len(payload) if isinstance(payload, bytes) else None,
+                )
             )
             continue
         try:
@@ -569,21 +619,21 @@ def read_message(message: IndexedMessage, max_body_chars: int) -> dict[str, obje
     truncated = len(body) > max_body_chars
     if truncated:
         body = body[:max_body_chars]
-    return {
-        "id": message.public_id,
-        "account": message.account_email,
-        "folder": message.folder_path.name,
-        "message_id": message.message_id,
-        "subject": message.subject,
-        "from": message.sender,
-        "to": message.recipients,
-        "date": message.date,
-        "read": message.is_read,
-        "body_type": body_type,
-        "body": body,
-        "body_truncated": truncated,
-        "attachments": attachments,
-    }
+    return MessageContent(
+        public_id=message.public_id,
+        account=message.account_email,
+        folder=message.folder_path.name,
+        message_id=message.message_id,
+        subject=message.subject,
+        sender=message.sender,
+        recipients=message.recipients,
+        date=message.date,
+        is_read=message.is_read,
+        body_type=body_type,
+        body=body,
+        body_truncated=truncated,
+        attachments=attachments,
+    )
 
 
 def parse_since(value: str) -> int:

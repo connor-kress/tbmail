@@ -4,11 +4,13 @@ import argparse
 import json
 import sqlite3
 import sys
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
 
 from .config import ConfigError, load_config
 from .index import (
+    MessageContent,
     count_messages,
     find_message,
     parse_since,
@@ -23,6 +25,65 @@ from .profile import (
     folder_counts,
     resolve_folder,
     select_accounts,
+)
+
+
+@dataclass
+class AccountResult:
+    alias: str | None
+    email: str
+    hostname: str
+
+
+@dataclass
+class AccountsResult:
+    profile: Path
+    accounts: list[AccountResult]
+
+
+@dataclass
+class FolderResult:
+    account: str
+    email: str
+    folder: str
+    total: int | None
+    unread: int | None
+    server_total: int | None
+    server_unread: int | None
+    last_sync: int | None
+
+
+@dataclass
+class StatusResult:
+    cache_updated: str
+    folders: list[FolderResult]
+
+
+@dataclass
+class CountResult:
+    count: int
+
+
+@dataclass
+class MessageResult:
+    public_id: str = field(metadata={"json_name": "id"})
+    account: str
+    folder: str
+    message_id: str | None
+    subject: str
+    sender: str = field(metadata={"json_name": "from"})
+    recipients: str = field(metadata={"json_name": "to"})
+    date: str | None
+    is_read: bool | None = field(metadata={"json_name": "read"})
+
+
+@dataclass
+class SearchResult:
+    messages: list[MessageResult]
+
+
+CommandResult = (
+    AccountsResult | StatusResult | CountResult | SearchResult | MessageContent
 )
 
 
@@ -88,8 +149,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _output(value: object) -> None:
-    json.dump(value, sys.stdout, indent=2, ensure_ascii=False)
+def _json_value(value: object) -> object:
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.metadata.get("json_name", item.name): _json_value(
+                getattr(value, item.name)
+            )
+            for item in fields(value)
+        }
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _output(value: CommandResult) -> None:
+    json.dump(_json_value(value), sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
 
 
@@ -104,23 +180,23 @@ def _account_name(email: str, aliases: dict[str, str]) -> str:
     )
 
 
-def run(args: argparse.Namespace) -> object:
+def run(args: argparse.Namespace) -> CommandResult:
     config = load_config(args.config)
     profile = discover_profile(args.profile)
     accounts = discover_accounts(profile, config)
 
     if args.command == "accounts":
-        return {
-            "profile": str(profile),
-            "accounts": [
-                {
-                    "alias": account.alias,
-                    "email": account.email,
-                    "hostname": account.hostname,
-                }
+        return AccountsResult(
+            profile=profile,
+            accounts=[
+                AccountResult(
+                    alias=account.alias,
+                    email=account.email,
+                    hostname=account.hostname,
+                )
                 for account in accounts
             ],
-        }
+        )
 
     if args.command == "show":
         message = find_message(args.message_id)
@@ -132,7 +208,7 @@ def run(args: argparse.Namespace) -> object:
         if args.max_body_chars < 1:
             raise ValueError("--max-body-chars must be positive")
         result = read_message(message, args.max_body_chars)
-        result["account"] = _account_name(message.account_email, config.aliases)
+        result.account = _account_name(message.account_email, config.aliases)
         return result
 
     selected = select_accounts(accounts, config, args.account, args.account_raw)
@@ -142,22 +218,25 @@ def run(args: argparse.Namespace) -> object:
 
     if args.command == "status":
         cache_mtime = (profile / "folderCache.json").stat().st_mtime
-        results = []
+        results: list[FolderResult] = []
         for account, folder in accounts_and_folders:
+            counts = folder_counts(profile, folder)
             results.append(
-                {
-                    "account": account.name,
-                    "email": account.email,
-                    "folder": args.folder,
-                    **folder_counts(profile, folder),
-                }
+                FolderResult(
+                    account=account.name,
+                    email=account.email,
+                    folder=args.folder,
+                    total=counts.total,
+                    unread=counts.unread,
+                    server_total=counts.server_total,
+                    server_unread=counts.server_unread,
+                    last_sync=counts.last_sync,
+                )
             )
-        return {
-            "cache_updated": datetime.fromtimestamp(cache_mtime)
-            .astimezone()
-            .isoformat(),
-            "folders": results,
-        }
+        return StatusResult(
+            cache_updated=datetime.fromtimestamp(cache_mtime).astimezone().isoformat(),
+            folders=results,
+        )
 
     if args.count and (args.limit is not None or args.offset is not None):
         raise ValueError("--count cannot be combined with --limit or --offset")
@@ -166,38 +245,45 @@ def run(args: argparse.Namespace) -> object:
     if args.offset is not None and args.offset < 0:
         raise ValueError("--offset must be nonnegative")
     since_epoch = parse_since(args.since) if args.since else None
-    search_arguments = {
-        "accounts_and_folders": accounts_and_folders,
-        "profile": profile,
-        "query": args.query,
-        "sender": args.sender,
-        "subject": args.subject,
-        "unread": args.unread,
-        "since_epoch": since_epoch,
-    }
     if args.count:
-        return {"count": count_messages(**search_arguments)}
+        return CountResult(
+            count=count_messages(
+                accounts_and_folders,
+                profile,
+                args.query,
+                args.sender,
+                args.subject,
+                args.unread,
+                since_epoch,
+            )
+        )
     messages = search_messages(
-        **search_arguments,
-        limit=args.limit,
-        offset=args.offset or 0,
+        accounts_and_folders,
+        profile,
+        args.query,
+        args.sender,
+        args.subject,
+        args.unread,
+        since_epoch,
+        args.limit,
+        args.offset or 0,
     )
-    return {
-        "messages": [
-            {
-                "id": message.public_id,
-                "account": _account_name(message.account_email, config.aliases),
-                "folder": args.folder,
-                "message_id": message.message_id,
-                "subject": message.subject,
-                "from": message.sender,
-                "to": message.recipients,
-                "date": message.date,
-                "read": message.is_read,
-            }
+    return SearchResult(
+        messages=[
+            MessageResult(
+                public_id=message.public_id,
+                account=_account_name(message.account_email, config.aliases),
+                folder=args.folder,
+                message_id=message.message_id,
+                subject=message.subject,
+                sender=message.sender,
+                recipients=message.recipients,
+                date=message.date,
+                is_read=message.is_read,
+            )
             for message in messages
         ]
-    }
+    )
 
 
 def main() -> None:

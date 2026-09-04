@@ -33,6 +33,15 @@ class MailAccount:
         return self.alias or self.email
 
 
+@dataclass
+class FolderCounts:
+    total: int | None
+    unread: int | None
+    server_total: int | None
+    server_unread: int | None
+    last_sync: int | None
+
+
 def _profile_roots() -> list[Path]:
     home = Path.home()
     return [
@@ -238,7 +247,7 @@ def resolve_folder(account: MailAccount, folder_name: str) -> Path:
     return folder
 
 
-def folder_counts(profile: Path, folder: Path) -> dict[str, int | None]:
+def folder_counts(profile: Path, folder: Path) -> FolderCounts:
     cache_path = profile / "folderCache.json"
     try:
         cache = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -261,10 +270,10 @@ def folder_counts(profile: Path, folder: Path) -> dict[str, int | None]:
         value = entry.get(name)
         return value if isinstance(value, int) and value >= 0 else None
 
-    return {
-        "total": count("totalMsgs"),
-        "unread": count("totalUnreadMsgs"),
-        "server_total": count("serverTotal"),
-        "server_unread": count("serverUnseen"),
-        "last_sync": count("lastSyncTimeInSec"),
-    }
+    return FolderCounts(
+        total=count("totalMsgs"),
+        unread=count("totalUnreadMsgs"),
+        server_total=count("serverTotal"),
+        server_unread=count("serverUnseen"),
+        last_sync=count("lastSyncTimeInSec"),
+    )

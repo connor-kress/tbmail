@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
@@ -9,7 +10,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from tbmail.cli import build_parser, run
+from tbmail.cli import _output, build_parser, run
 from tbmail.config import default_config_path
 
 
@@ -135,8 +136,8 @@ class TbmailTestCase(unittest.TestCase):
     def test_accounts_lists_alias(self) -> None:
         result = run(self.parse("accounts"))
 
-        self.assertEqual(result["accounts"][0]["alias"], "personal")
-        self.assertEqual(result["accounts"][0]["email"], "person@example.com")
+        self.assertEqual(result.accounts[0].alias, "personal")
+        self.assertEqual(result.accounts[0].email, "person@example.com")
 
     def test_default_config_uses_xdg_config_home(self) -> None:
         config_home = self.root / "xdg-config"
@@ -152,22 +153,35 @@ class TbmailTestCase(unittest.TestCase):
         alias_result = run(self.parse("status", "-a", "personal"))
         raw_result = run(self.parse("status", "--account-raw", "person@example.com"))
 
-        self.assertEqual(alias_result["folders"][0]["unread"], 1)
-        self.assertEqual(raw_result["folders"][0]["total"], 2)
+        self.assertEqual(alias_result.folders[0].unread, 1)
+        self.assertEqual(raw_result.folders[0].total, 2)
 
     def test_search_and_show_downloaded_message(self) -> None:
         search_result = run(
             self.parse("search", "-a", "personal", "--unread", "Sender")
         )
 
-        self.assertEqual(len(search_result["messages"]), 1)
-        summary = search_result["messages"][0]
-        self.assertEqual(summary["subject"], "Pending example")
-        self.assertFalse(summary["read"])
+        self.assertEqual(len(search_result.messages), 1)
+        summary = search_result.messages[0]
+        self.assertEqual(summary.subject, "Pending example")
+        self.assertFalse(summary.is_read)
 
-        show_result = run(self.parse("show", summary["id"]))
-        self.assertEqual(show_result["account"], "personal")
-        self.assertEqual(show_result["body"], "This is the unread body.\n")
+        show_result = run(self.parse("show", summary.public_id))
+        self.assertEqual(show_result.account, "personal")
+        self.assertEqual(show_result.body, "This is the unread body.\n")
+
+    def test_search_result_keeps_cli_json_field_names(self) -> None:
+        result = run(self.parse("search", "--limit", "1"))
+        output = io.StringIO()
+
+        with patch("sys.stdout", output):
+            _output(result)
+
+        message = json.loads(output.getvalue())["messages"][0]
+        self.assertIn("id", message)
+        self.assertIn("from", message)
+        self.assertIn("to", message)
+        self.assertIn("read", message)
 
     def test_search_filters_subject_and_date(self) -> None:
         result = run(
@@ -182,9 +196,9 @@ class TbmailTestCase(unittest.TestCase):
             )
         )
 
-        self.assertEqual(len(result["messages"]), 1)
-        self.assertEqual(result["messages"][0]["subject"], "Read example")
-        self.assertTrue(result["messages"][0]["read"])
+        self.assertEqual(len(result.messages), 1)
+        self.assertEqual(result.messages[0].subject, "Read example")
+        self.assertTrue(result.messages[0].is_read)
 
     def test_search_uses_mbox_read_state_before_gloda_indexes_account(self) -> None:
         contents = self.inbox.read_bytes()
@@ -199,7 +213,7 @@ class TbmailTestCase(unittest.TestCase):
         result = run(self.parse("search", "-a", "personal", "--unread"))
 
         self.assertEqual(
-            [message["subject"] for message in result["messages"]],
+            [message.subject for message in result.messages],
             ["Pending example"],
         )
 
@@ -216,12 +230,10 @@ class TbmailTestCase(unittest.TestCase):
         result = run(self.parse("search", "-a", "new"))
 
         self.assertEqual(
-            [message["subject"] for message in result["messages"]],
+            [message.subject for message in result.messages],
             ["Read example", "Pending example"],
         )
-        self.assertTrue(
-            all(message["account"] == "new" for message in result["messages"])
-        )
+        self.assertTrue(all(message.account == "new" for message in result.messages))
 
     def test_search_supports_deterministic_index_offset(self) -> None:
         all_messages = run(self.parse("search"))
@@ -229,11 +241,11 @@ class TbmailTestCase(unittest.TestCase):
         second_page = run(self.parse("search", "--limit", "1", "--offset", "1"))
 
         self.assertEqual(
-            [message["subject"] for message in all_messages["messages"]],
+            [message.subject for message in all_messages.messages],
             ["Read example", "Pending example"],
         )
-        self.assertEqual(first_page["messages"][0]["subject"], "Read example")
-        self.assertEqual(second_page["messages"][0]["subject"], "Pending example")
+        self.assertEqual(first_page.messages[0].subject, "Read example")
+        self.assertEqual(second_page.messages[0].subject, "Pending example")
 
     def test_search_rejects_negative_offset(self) -> None:
         with self.assertRaisesRegex(ValueError, "--offset must be nonnegative"):
@@ -250,7 +262,7 @@ class TbmailTestCase(unittest.TestCase):
             )
         )
 
-        self.assertEqual(result, {"count": 1})
+        self.assertEqual(result.count, 1)
 
     def test_search_count_rejects_pagination(self) -> None:
         for pagination in (("--limit", "1"), ("--offset", "0")):
