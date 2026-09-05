@@ -7,11 +7,18 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 from tbmail.cli import _output, build_parser, run
-from tbmail.config import default_config_path
+from tbmail.config import DEFAULT_THUNDERBIRD_COMMAND, default_config_path, load_config
+from tbmail.index import (
+    default_cache_path,
+    find_message,
+    resolve_message_for_write,
+)
+from tbmail.profile import discover_accounts
 
 
 class TbmailTestCase(unittest.TestCase):
@@ -123,6 +130,19 @@ class TbmailTestCase(unittest.TestCase):
             {"XDG_CACHE_HOME": str(self.root / "cache")},
         )
         self.environment.start()
+        ipc = self.profile / "tbmail-ipc"
+        ipc.mkdir()
+        (ipc / "last-sync.json").write_text(
+            json.dumps(
+                {
+                    "protocolVersion": 1,
+                    "accounts": {
+                        "server1": datetime.now(UTC).isoformat(),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         self.environment.stop()
@@ -148,6 +168,35 @@ class TbmailTestCase(unittest.TestCase):
             self.assertEqual(
                 default_config_path(), config_home / "tbmail" / "config.toml"
             )
+
+    def test_config_uses_argument_array_for_thunderbird(self) -> None:
+        self.assertEqual(DEFAULT_THUNDERBIRD_COMMAND, ("thunderbird", "--headless"))
+        self.assertEqual(
+            load_config(self.config).thunderbird_command, DEFAULT_THUNDERBIRD_COMMAND
+        )
+        self.config.write_text(
+            '[accounts]\npersonal = "person@example.com"\n'
+            '[thunderbird]\ncommand = ["thunderbird", "--headless"]\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            load_config(self.config).thunderbird_command,
+            ("thunderbird", "--headless"),
+        )
+
+    def test_config_rejects_visible_or_profile_selecting_commands(self) -> None:
+        for command in (
+            '["thunderbird"]',
+            '["thunderbird", "--headless", "--profile", "/other"]',
+        ):
+            with self.subTest(command=command):
+                self.config.write_text(
+                    '[accounts]\npersonal = "person@example.com"\n'
+                    f"[thunderbird]\ncommand = {command}\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "thunderbird.command"):
+                    load_config(self.config)
 
     def test_status_supports_alias_and_raw_address(self) -> None:
         alias_result = run(self.parse("status", "-a", "personal"))
@@ -272,6 +321,84 @@ class TbmailTestCase(unittest.TestCase):
                     "--count cannot be combined with --limit or --offset",
                 ):
                     run(self.parse("search", "--count", *pagination))
+
+    def test_mark_read_updates_cache_and_survives_stale_gloda(self) -> None:
+        search_result = run(self.parse("search", "--unread"))
+        message = search_result.messages[0]
+        with patch(
+            "tbmail.cli.execute",
+            return_value=(
+                "request-1",
+                {"matchedBy": "storeToken", "folderUri": "imap://example/INBOX"},
+            ),
+        ) as execute:
+            result = run(self.parse("mark-read", message.public_id))
+
+        self.assertTrue(result.is_read)
+        self.assertEqual(execute.call_args.args[2], "mark-read")
+        self.assertEqual(
+            execute.call_args.args[3]["folderPath"],
+            "ImapMail/imap.example.com/INBOX",
+        )
+        self.assertNotIn("folderUri", execute.call_args.args[3])
+        self.assertTrue(find_message(message.public_id).is_read)
+        repeated = run(self.parse("search", "--unread"))
+        self.assertEqual(repeated.messages, [])
+
+    def test_write_resolution_recovers_after_compaction(self) -> None:
+        search_result = run(self.parse("search"))
+        original = find_message(search_result.messages[0].public_id)
+        self.inbox.write_bytes(b"From compaction padding\n" + self.inbox.read_bytes())
+        accounts = discover_accounts(self.profile, load_config(self.config))
+
+        current, account = resolve_message_for_write(
+            original, accounts, self.profile, default_cache_path()
+        )
+
+        self.assertEqual(account.server_id, "server1")
+        self.assertEqual(current.message_id, original.message_id)
+        self.assertNotEqual(current.public_id, original.public_id)
+
+    def test_sync_uses_selected_server_keys_and_timeout(self) -> None:
+        response = {
+            "accounts": [
+                {
+                    "serverKey": "server1",
+                    "status": "success",
+                    "folders": [],
+                }
+            ]
+        }
+        with patch(
+            "tbmail.cli.execute", return_value=("request-2", response)
+        ) as execute:
+            result = run(self.parse("sync", "-a", "personal", "--timeout", "12"))
+
+        self.assertEqual(result.accounts[0].account, "personal")
+        self.assertEqual(execute.call_args.args[3], {"serverKeys": ["server1"]})
+        self.assertEqual(execute.call_args.args[4], 12)
+
+    def test_stale_warning_is_json_on_stderr(self) -> None:
+        (self.profile / "tbmail-ipc" / "last-sync.json").unlink()
+        errors = io.StringIO()
+
+        with patch("sys.stderr", errors):
+            result = run(self.parse("status"))
+
+        self.assertEqual(result.folders[0].account, "personal")
+        self.assertEqual(
+            json.loads(errors.getvalue()),
+            {"warning": "Local mail for personal has never been synchronized"},
+        )
+
+    def test_accounts_does_not_warn_when_sync_state_is_missing(self) -> None:
+        (self.profile / "tbmail-ipc" / "last-sync.json").unlink()
+        errors = io.StringIO()
+
+        with patch("sys.stderr", errors):
+            run(self.parse("accounts"))
+
+        self.assertEqual(errors.getvalue(), "")
 
 
 if __name__ == "__main__":

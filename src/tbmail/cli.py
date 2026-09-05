@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .bridge import BridgeError, execute, stale_sync_warnings
 from .config import ConfigError, load_config
 from .index import (
     MessageContent,
@@ -16,9 +17,12 @@ from .index import (
     parse_since,
     read_message,
     refresh_message,
+    resolve_message_for_write,
     search_messages,
+    update_cached_read_state,
 )
 from .profile import (
+    MailAccount,
     ProfileError,
     discover_accounts,
     discover_profile,
@@ -82,8 +86,53 @@ class SearchResult:
     messages: list[MessageResult]
 
 
+@dataclass
+class FolderSyncResult:
+    uri: str
+    phase: str
+    status: str
+    result: str | None = None
+    error: object | None = None
+
+
+@dataclass
+class AccountSyncResult:
+    account: str
+    email: str
+    server_key: str
+    status: str
+    folders: list[FolderSyncResult]
+    incomplete_phases: list[str] = field(default_factory=list)
+    error: object | None = None
+
+
+@dataclass
+class SyncResult:
+    request_id: str
+    status: str
+    accounts: list[AccountSyncResult]
+
+
+@dataclass
+class MarkResult:
+    request_id: str
+    status: str
+    public_id: str = field(metadata={"json_name": "id"})
+    is_read: bool = field(metadata={"json_name": "read"})
+    matched_by: str
+    folder_uri: str
+    cache_updated: bool
+    cache_error: str | None = None
+
+
 CommandResult = (
-    AccountsResult | StatusResult | CountResult | SearchResult | MessageContent
+    AccountsResult
+    | StatusResult
+    | CountResult
+    | SearchResult
+    | MessageContent
+    | SyncResult
+    | MarkResult
 )
 
 
@@ -106,7 +155,7 @@ def _account_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="tbmail", description="Read locally downloaded Thunderbird mail"
+        prog="tbmail", description="Read and update Thunderbird mail"
     )
     parser.add_argument("--config", type=Path, help="path to config.toml")
     parser.add_argument("--profile", type=Path, help="path to Thunderbird profile")
@@ -146,6 +195,24 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument(
         "--max-body-chars", type=int, default=100_000, help="maximum body characters"
     )
+
+    sync = subparsers.add_parser(
+        "sync", help="refresh Thunderbird and download all message bodies"
+    )
+    _account_arguments(sync)
+    sync.add_argument(
+        "--timeout",
+        type=float,
+        default=300,
+        help="total timeout in seconds (default: 300)",
+    )
+
+    for command, help_text in (
+        ("mark-read", "mark a message as read"),
+        ("mark-unread", "mark a message as unread"),
+    ):
+        mark = subparsers.add_parser(command, help=help_text)
+        mark.add_argument("message_id", help="tbmail message ID")
     return parser
 
 
@@ -180,6 +247,70 @@ def _account_name(email: str, aliases: dict[str, str]) -> str:
     )
 
 
+def _warn_if_stale(profile: Path, accounts: list[MailAccount]) -> None:
+    for warning in stale_sync_warnings(profile, accounts):
+        json.dump({"warning": warning}, sys.stderr, separators=(",", ":"))
+        sys.stderr.write("\n")
+
+
+def _sync_result(
+    request_id: str,
+    response: dict[str, object],
+    selected: list[MailAccount],
+    aliases: dict[str, str],
+) -> SyncResult:
+    by_server = {account.server_id: account for account in selected}
+    raw_accounts = response.get("accounts")
+    if not isinstance(raw_accounts, list):
+        raise ValueError("Thunderbird returned an invalid sync result")
+    accounts = []
+    returned_servers: list[str] = []
+    for raw_account in raw_accounts:
+        if not isinstance(raw_account, dict):
+            raise ValueError("Thunderbird returned an invalid account sync result")
+        server_key = str(raw_account.get("serverKey", ""))
+        returned_servers.append(server_key)
+        account = by_server.get(server_key)
+        if not account:
+            raise ValueError(
+                f"Thunderbird returned an unknown server key: {server_key}"
+            )
+        raw_folders = raw_account.get("folders", [])
+        if not isinstance(raw_folders, list):
+            raise ValueError("Thunderbird returned invalid folder sync results")
+        folders = [
+            FolderSyncResult(
+                uri=str(folder.get("uri", "")),
+                phase=str(folder.get("phase", "")),
+                status=str(folder.get("status", "")),
+                result=folder.get("result"),
+                error=folder.get("error"),
+            )
+            for folder in raw_folders
+            if isinstance(folder, dict)
+        ]
+        incomplete_phases = raw_account.get("incompletePhases", [])
+        if not isinstance(incomplete_phases, list):
+            raise ValueError("Thunderbird returned invalid incomplete sync phases")
+        accounts.append(
+            AccountSyncResult(
+                account=_account_name(account.email, aliases),
+                email=account.email,
+                server_key=server_key,
+                status=str(raw_account.get("status", "")),
+                folders=folders,
+                incomplete_phases=[str(phase) for phase in incomplete_phases],
+                error=raw_account.get("error"),
+            )
+        )
+    expected_servers = [account.server_id for account in selected]
+    if sorted(returned_servers) != sorted(expected_servers) or len(
+        returned_servers
+    ) != len(set(returned_servers)):
+        raise ValueError("Thunderbird sync result did not contain every account once")
+    return SyncResult(request_id=request_id, status="success", accounts=accounts)
+
+
 def run(args: argparse.Namespace) -> CommandResult:
     config = load_config(args.config)
     profile = discover_profile(args.profile)
@@ -209,9 +340,66 @@ def run(args: argparse.Namespace) -> CommandResult:
             raise ValueError("--max-body-chars must be positive")
         result = read_message(message, args.max_body_chars)
         result.account = _account_name(message.account_email, config.aliases)
+        relevant = [
+            account
+            for account in accounts
+            if account.email.casefold() == message.account_email
+        ]
+        _warn_if_stale(profile, relevant)
         return result
 
+    if args.command in {"mark-read", "mark-unread"}:
+        message = find_message(args.message_id)
+        message, account = resolve_message_for_write(message, accounts, profile)
+        if not message.message_id:
+            raise ValueError(
+                "Message has no RFC Message-ID and cannot be updated safely"
+            )
+        desired_read = args.command == "mark-read"
+        request_id, response = execute(
+            profile,
+            config.thunderbird_command,
+            args.command,
+            {
+                "serverKey": account.server_id,
+                "folderPath": message.folder_path.relative_to(profile).as_posix(),
+                "mboxOffset": message.offset,
+                "messageId": message.message_id,
+            },
+            30,
+        )
+        cache_updated = True
+        cache_error = None
+        try:
+            update_cached_read_state(message.public_id, desired_read)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            cache_updated = False
+            cache_error = str(exc)
+        return MarkResult(
+            request_id=request_id,
+            status="success",
+            public_id=message.public_id,
+            is_read=desired_read,
+            matched_by=str(response.get("matchedBy", "")),
+            folder_uri=str(response.get("folderUri", "")),
+            cache_updated=cache_updated,
+            cache_error=cache_error,
+        )
+
     selected = select_accounts(accounts, config, args.account, args.account_raw)
+
+    if args.command == "sync":
+        if args.timeout <= 0:
+            raise ValueError("--timeout must be positive")
+        request_id, response = execute(
+            profile,
+            config.thunderbird_command,
+            "sync",
+            {"serverKeys": [account.server_id for account in selected]},
+            args.timeout,
+        )
+        return _sync_result(request_id, response, selected, config.aliases)
+
     accounts_and_folders = [
         (account, resolve_folder(account, args.folder)) for account in selected
     ]
@@ -233,10 +421,12 @@ def run(args: argparse.Namespace) -> CommandResult:
                     last_sync=counts.last_sync,
                 )
             )
-        return StatusResult(
+        result = StatusResult(
             cache_updated=datetime.fromtimestamp(cache_mtime).astimezone().isoformat(),
             folders=results,
         )
+        _warn_if_stale(profile, selected)
+        return result
 
     if args.count and (args.limit is not None or args.offset is not None):
         raise ValueError("--count cannot be combined with --limit or --offset")
@@ -255,7 +445,9 @@ def run(args: argparse.Namespace) -> CommandResult:
             unread=args.unread,
             since_epoch=since_epoch,
         )
-        return CountResult(count)
+        result = CountResult(count)
+        _warn_if_stale(profile, selected)
+        return result
     messages = search_messages(
         accounts_and_folders,
         profile=profile,
@@ -267,7 +459,7 @@ def run(args: argparse.Namespace) -> CommandResult:
         limit=args.limit,
         offset=args.offset or 0,
     )
-    return SearchResult(
+    result = SearchResult(
         messages=[
             MessageResult(
                 public_id=message.public_id,
@@ -283,6 +475,8 @@ def run(args: argparse.Namespace) -> CommandResult:
             for message in messages
         ]
     )
+    _warn_if_stale(profile, selected)
+    return result
 
 
 def main() -> None:
@@ -290,6 +484,10 @@ def main() -> None:
     args = parser.parse_args()
     try:
         _output(run(args))
+    except BridgeError as exc:
+        json.dump(exc.json_value(), sys.stderr, ensure_ascii=False)
+        sys.stderr.write("\n")
+        raise SystemExit(1) from exc
     except (ConfigError, ProfileError, OSError, sqlite3.Error, ValueError) as exc:
         json.dump({"error": str(exc)}, sys.stderr)
         sys.stderr.write("\n")

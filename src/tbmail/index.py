@@ -5,7 +5,7 @@ import os
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from email import policy
 from email.message import Message
 from email.parser import BytesHeaderParser, BytesParser
@@ -117,6 +117,11 @@ def _connect(path: Path) -> sqlite3.Connection:
             ON messages(account_email, folder_path, date_epoch DESC);
         CREATE INDEX IF NOT EXISTS messages_message_id
             ON messages(account_email, folder_path, message_id);
+        CREATE TABLE IF NOT EXISTS read_overrides (
+            public_id TEXT PRIMARY KEY,
+            is_read INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        );
         """
     )
     connection.commit()
@@ -342,12 +347,7 @@ def sync_read_state(
     if not gloda_path.is_file():
         return
 
-    relative_folder = folder.relative_to(account.directory).as_posix()
-    folder_parts = [part.removesuffix(".sbd") for part in relative_folder.split("/")]
-    encoded_folder = "/".join(quote(part, safe="[]") for part in folder_parts)
-    folder_uri = (
-        f"imap://{quote(account.email, safe='')}@{account.hostname}/{encoded_folder}"
-    )
+    current_folder_uri = folder_uri(account, folder)
 
     rows = None
     for query in ("mode=ro", "mode=ro&immutable=1"):
@@ -372,7 +372,7 @@ def sync_read_state(
                     JOIN folderLocations AS f ON f.id = m.folderID
                     WHERE f.folderURI = ? AND m.deleted = 0
                     """,
-                    (read_key, folder_uri),
+                    (read_key, current_folder_uri),
                 ).fetchall()
             break
         except sqlite3.OperationalError:
@@ -388,12 +388,29 @@ def sync_read_state(
     cache = cache_path or default_cache_path()
     with closing(_connect(cache)) as connection:
         with connection:
+            now = int(datetime.now().timestamp())
+            connection.execute(
+                "DELETE FROM read_overrides WHERE expires_at <= ?", (now,)
+            )
             connection.executemany(
                 """
                 UPDATE messages SET is_read = ?
                 WHERE account_email = ? AND folder_path = ? AND message_id = ?
                 """,
                 updates,
+            )
+            connection.execute(
+                """
+                UPDATE messages
+                SET is_read = (
+                    SELECT is_read FROM read_overrides
+                    WHERE read_overrides.public_id = messages.public_id
+                )
+                WHERE public_id IN (
+                    SELECT public_id FROM read_overrides WHERE expires_at > ?
+                )
+                """,
+                (now,),
             )
 
 
@@ -565,6 +582,85 @@ def refresh_message(
     ensure_indexed(account, message.folder_path, cache_path)
     sync_read_state(profile, account, message.folder_path, cache_path)
     return find_message(message.public_id, cache_path)
+
+
+def resolve_message_for_write(
+    message: IndexedMessage,
+    accounts: list[MailAccount],
+    profile: Path,
+    cache_path: Path | None = None,
+) -> tuple[IndexedMessage, MailAccount]:
+    account = next(
+        (
+            candidate
+            for candidate in accounts
+            if candidate.email.casefold() == message.account_email
+        ),
+        None,
+    )
+    if not account:
+        raise ValueError(
+            f"Message account is no longer in Thunderbird: {message.account_email}"
+        )
+    try:
+        message.folder_path.resolve().relative_to(account.directory.resolve())
+    except ValueError as exc:
+        raise ValueError("Message does not belong to the selected profile") from exc
+
+    ensure_indexed(account, message.folder_path, cache_path)
+    sync_read_state(profile, account, message.folder_path, cache_path)
+    try:
+        return find_message(message.public_id, cache_path), account
+    except ValueError:
+        if not message.message_id:
+            raise ValueError(
+                "Message moved during mailbox compaction; run search again"
+            ) from None
+
+    cache = cache_path or default_cache_path()
+    with closing(_connect(cache)) as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM messages
+            WHERE account_email = ? AND folder_path = ? AND message_id = ?
+            """,
+            (message.account_email, str(message.folder_path), message.message_id),
+        ).fetchall()
+    if len(rows) != 1:
+        detail = "not found" if not rows else "ambiguous"
+        raise ValueError(f"Message-ID is {detail} after mailbox compaction")
+    return _row_to_message(rows[0]), account
+
+
+def update_cached_read_state(
+    public_id: str,
+    is_read: bool,
+    cache_path: Path | None = None,
+) -> None:
+    cache = cache_path or default_cache_path()
+    expires_at = int((datetime.now() + timedelta(days=1)).timestamp())
+    with closing(_connect(cache)) as connection:
+        with connection:
+            cursor = connection.execute(
+                "UPDATE messages SET is_read = ? WHERE public_id = ?",
+                (int(is_read), public_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Message not found in the local index: {public_id}")
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO read_overrides(public_id, is_read, expires_at)
+                VALUES (?, ?, ?)
+                """,
+                (public_id, int(is_read), expires_at),
+            )
+
+
+def folder_uri(account: MailAccount, folder: Path) -> str:
+    relative_folder = folder.relative_to(account.directory).as_posix()
+    folder_parts = [part.removesuffix(".sbd") for part in relative_folder.split("/")]
+    encoded_folder = "/".join(quote(part, safe="[]") for part in folder_parts)
+    return f"imap://{quote(account.email, safe='')}@{account.hostname}/{encoded_folder}"
 
 
 def read_message(message: IndexedMessage, max_body_chars: int) -> MessageContent:

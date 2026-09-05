@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tbmail"
-version = "0.1.0"
-description = "Read-only CLI for locally downloaded Thunderbird mail"
+version = "0.2.0"
+description = "CLI for reading and updating Thunderbird mail"
 requires-python = ">=3.11"
 
 [project.scripts]

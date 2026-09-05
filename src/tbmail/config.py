@@ -10,10 +10,17 @@ class ConfigError(ValueError):
     pass
 
 
+DEFAULT_THUNDERBIRD_COMMAND = (
+    "thunderbird",
+    "--headless",
+)
+
+
 @dataclass(frozen=True)
 class Config:
     path: Path
     aliases: dict[str, str]
+    thunderbird_command: tuple[str, ...] = DEFAULT_THUNDERBIRD_COMMAND
 
 
 def default_config_path() -> Path:
@@ -56,4 +63,22 @@ def load_config(path: Path | None = None) -> Config:
         aliases[normalized_alias] = email.strip()
         emails.add(normalized_email)
 
-    return Config(config_path, aliases)
+    thunderbird = data.get("thunderbird", {})
+    if not isinstance(thunderbird, dict):
+        raise ConfigError("[thunderbird] must be a table")
+    command = thunderbird.get("command", list(DEFAULT_THUNDERBIRD_COMMAND))
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(argument, str) or not argument for argument in command)
+    ):
+        raise ConfigError("thunderbird.command must be a non-empty array of strings")
+    if "--headless" not in command:
+        raise ConfigError("thunderbird.command must include --headless")
+    profile_options = {"--profile", "-profile", "-P", "--ProfileManager"}
+    if any(argument in profile_options for argument in command):
+        raise ConfigError(
+            "thunderbird.command must not select a profile; tbmail adds it safely"
+        )
+
+    return Config(config_path, aliases, tuple(command))

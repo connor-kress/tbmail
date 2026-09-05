@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""Package and install the tbmail Thunderbird Experiment."""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import contextlib
+import fcntl
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import uuid
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+APP_ID = "org.mozilla.thunderbird_esr"
+ADDON_ID = "tbmail-bridge@ckress.dev"
+PROTOCOL_VERSION = 1
+REPOSITORY = Path(__file__).resolve().parents[1]
+SOURCE = REPOSITORY / "thunderbird-addon"
+TMP = REPOSITORY / "tmp" / "thunderbird-addon"
+
+
+class SetupError(RuntimeError):
+    pass
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Install and verify the tbmail Thunderbird add-on"
+    )
+    parser.add_argument("--profile", type=Path, help="Thunderbird profile directory")
+    return parser.parse_args()
+
+
+def flatpak_version() -> str:
+    if not shutil.which("flatpak"):
+        raise SetupError("flatpak is not installed or is not on PATH")
+    result = subprocess.run(
+        ["flatpak", "list", "--app", "--columns=application,version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        raise SetupError(f"Flatpak application {APP_ID} is not installed")
+    versions = {
+        application: version
+        for line in result.stdout.splitlines()
+        if "\t" in line
+        for application, version in [line.split("\t", 1)]
+    }
+    version = versions.get(APP_ID, "")
+    if not version:
+        raise SetupError(f"Flatpak application {APP_ID} is not installed")
+    if not re.fullmatch(r"140(?:\.[0-9]+)*(?:esr)?", version):
+        raise SetupError(
+            f"unsupported Thunderbird version: {version}; expected 140.* ESR"
+        )
+    return version
+
+
+def profile_root() -> Path:
+    return Path.home() / ".var" / "app" / APP_ID / ".thunderbird"
+
+
+def discover_profile(override: Path | None, root: Path | None = None) -> Path:
+    if override is not None:
+        profile = override.expanduser().resolve()
+        if not (profile / "prefs.js").is_file():
+            raise SetupError(f"not a Thunderbird profile: {profile}")
+        return profile
+
+    root = root or profile_root()
+    profiles_ini = root / "profiles.ini"
+    if not profiles_ini.is_file():
+        raise SetupError(f"Thunderbird profiles file not found: {profiles_ini}")
+    config = configparser.RawConfigParser()
+    config.read(profiles_ini, encoding="utf-8")
+    candidates: list[tuple[int, Path]] = []
+    for section in config.sections():
+        if section.startswith("Install") and config.has_option(section, "Default"):
+            value = config.get(section, "Default")
+            priority = 0 if config.getboolean(section, "Locked", fallback=False) else 1
+            candidates.append((priority, root / value))
+        elif section.startswith("Profile") and config.has_option(section, "Path"):
+            value = Path(config.get(section, "Path"))
+            path = (
+                root / value
+                if config.getboolean(section, "IsRelative", fallback=True)
+                else value
+            )
+            priority = 2 if config.getboolean(section, "Default", fallback=False) else 3
+            candidates.append((priority, path))
+    for _, candidate in sorted(candidates):
+        candidate = candidate.expanduser().resolve()
+        if (candidate / "prefs.js").is_file():
+            return candidate
+    raise SetupError("no usable active Thunderbird profile found")
+
+
+def assert_profile_stopped(profile: Path) -> None:
+    with profile_guard(profile):
+        pass
+
+
+@contextlib.contextmanager
+def profile_guard(profile: Path):
+    """Acquire Thunderbird's nonblocking POSIX profile lock."""
+    lock = profile / ".parentlock"
+    if lock.is_symlink():
+        raise SetupError(f"refusing symlinked Thunderbird profile lock: {lock}")
+    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        os.close(descriptor)
+        raise SetupError(f"Thunderbird profile is active: {profile}") from error
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def atomic_bytes(path: Path, value: bytes, mode: int) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def addon_manifest() -> dict[str, object]:
+    with (SOURCE / "manifest.json").open(encoding="utf-8") as file:
+        return json.load(file)
+
+
+def package_xpi(destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(SOURCE.rglob("*")):
+            if path.is_file():
+                info = zipfile.ZipInfo(path.relative_to(SOURCE).as_posix())
+                info.date_time = (2020, 1, 1, 0, 0, 0)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o100644 << 16
+                archive.writestr(info, path.read_bytes())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, destination)
+
+
+def update_integer_pref(text: str, name: str, transform) -> str:
+    pattern = re.compile(
+        rf'^user_pref\("{re.escape(name)}",\s*(-?\d+)\);\s*$', re.MULTILINE
+    )
+    matches = list(pattern.finditer(text))
+    current = int(matches[-1].group(1)) if matches else None
+    value = transform(current)
+    replacement = f'user_pref("{name}", {value});'
+    if matches:
+        start, end = matches[-1].span()
+        text = text[:start] + replacement + text[end:]
+    else:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += replacement + "\n"
+    return text
+
+
+def allow_profile_sideload(profile: Path) -> None:
+    prefs = profile / "prefs.js"
+    text = prefs.read_text(encoding="utf-8")
+    text = update_integer_pref(
+        text,
+        "extensions.autoDisableScopes",
+        lambda value: (15 if value is None else value) & ~1,
+    )
+    text = update_integer_pref(
+        text,
+        "extensions.startupScanScopes",
+        lambda value: (4 if value is None else value) | 1,
+    )
+    temporary = prefs.with_name(f".{prefs.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.chmod(temporary, stat.S_IMODE(prefs.stat().st_mode))
+    os.replace(temporary, prefs)
+
+
+def install_xpi(profile: Path, xpi: Path) -> tuple[Path, Path | None]:
+    extensions = profile / "extensions"
+    extensions.mkdir(mode=0o700, exist_ok=True)
+    destination = extensions / f"{ADDON_ID}.xpi"
+    backup = None
+    if destination.exists():
+        backup_dir = TMP / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = backup_dir / f"{ADDON_ID}-{time.strftime('%Y%m%d-%H%M%S')}.xpi"
+        suffix = 1
+        while backup.exists():
+            backup = backup.with_name(f"{backup.stem}-{suffix}.xpi")
+            suffix += 1
+        staged_backup = backup.with_name(f".{backup.name}.{uuid.uuid4().hex}.tmp")
+        shutil.copyfile(destination, staged_backup)
+        os.chmod(staged_backup, 0o600)
+        os.replace(staged_backup, backup)
+    staged = extensions / f".{ADDON_ID}.{uuid.uuid4().hex}.tmp"
+    shutil.copyfile(xpi, staged)
+    os.chmod(staged, 0o600)
+    os.replace(staged, destination)
+    return destination, backup
+
+
+def sandbox_profile_path(profile: Path) -> Path:
+    """Translate Flatpak's host-side app home to its sandbox-side home."""
+    app_home = Path.home() / ".var" / "app" / APP_ID
+    try:
+        relative = profile.resolve().relative_to(app_home.resolve())
+    except ValueError as error:
+        raise SetupError(
+            f"profile is outside Flatpak's accessible app data: {profile}"
+        ) from error
+    return Path.home() / relative
+
+
+def atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        json.dump(value, file, separators=(",", ":"))
+        file.flush()
+        os.fsync(file.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def wait_for_heartbeat(
+    path: Path, addon_version: str, started: float
+) -> dict[str, object]:
+    deadline = time.monotonic() + 60
+    last_error = "heartbeat was not created"
+    while time.monotonic() < deadline:
+        try:
+            heartbeat = json.loads(path.read_text(encoding="utf-8"))
+            timestamp = datetime.fromisoformat(
+                heartbeat["timestamp"].replace("Z", "+00:00")
+            ).timestamp()
+            if (
+                heartbeat.get("protocolVersion") == PROTOCOL_VERSION
+                and heartbeat.get("addonVersion") == addon_version
+                and heartbeat.get("headless") is True
+                and timestamp >= started - 2
+            ):
+                return heartbeat
+            last_error = "heartbeat has the wrong protocol, version, or timestamp"
+        except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError) as error:
+            last_error = str(error)
+        time.sleep(0.25)
+    raise SetupError(f"add-on heartbeat verification timed out: {last_error}")
+
+
+def request_shutdown(ipc: Path) -> str:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        request_id = f"setup-{uuid.uuid4().hex}"
+        request = ipc / "requests" / f"{request_id}.json"
+        response = ipc / "responses" / f"{request_id}.json"
+        atomic_json(
+            request,
+            {
+                "protocolVersion": PROTOCOL_VERSION,
+                "requestId": request_id,
+                "operation": "shutdown",
+                "deadline": int((time.time() + 30) * 1000),
+            },
+        )
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    value = json.loads(response.read_text(encoding="utf-8"))
+                    response.unlink(missing_ok=True)
+                    if value.get("status") == "success":
+                        return request_id
+                    if value.get("status") != "busy":
+                        raise SetupError(f"add-on refused clean shutdown: {value}")
+                    break
+                except FileNotFoundError:
+                    time.sleep(0.25)
+        finally:
+            request.unlink(missing_ok=True)
+            response.unlink(missing_ok=True)
+        time.sleep(0.25)
+    raise SetupError("clean shutdown request timed out")
+
+
+def cleanup_setup_queue(ipc: Path) -> None:
+    for directory_name in ("requests", "responses"):
+        directory = ipc / directory_name
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("setup-*"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+
+
+def wait_for_profile_stop(profile: Path, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            assert_profile_stopped(profile)
+            return True
+        except SetupError:
+            time.sleep(0.25)
+    return False
+
+
+def main() -> int:
+    try:
+        arguments = parse_arguments()
+        version = flatpak_version()
+        profile = discover_profile(arguments.profile)
+        assert_profile_stopped(profile)
+        sandbox_profile = sandbox_profile_path(profile)
+        manifest = addon_manifest()
+        addon_version = str(manifest["version"])
+        xpi = TMP / f"tbmail-bridge-{addon_version}.xpi"
+        package_xpi(xpi)
+        prefs_path = profile / "prefs.js"
+        original_prefs = prefs_path.read_bytes()
+        destination = profile / "extensions" / f"{ADDON_ID}.xpi"
+        original_xpi = destination.read_bytes() if destination.is_file() else None
+        ipc = profile / "tbmail-ipc"
+        with profile_guard(profile):
+            cleanup_setup_queue(ipc)
+            allow_profile_sideload(profile)
+            destination, backup = install_xpi(profile, xpi)
+        (ipc / "heartbeat.json").unlink(missing_ok=True)
+        log_path = TMP / "setup-thunderbird.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        started = time.time()
+        try:
+            with log_path.open("ab") as output:
+                process = subprocess.Popen(
+                    [
+                        "flatpak",
+                        "run",
+                        APP_ID,
+                        "--headless",
+                        "--profile",
+                        str(sandbox_profile),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            heartbeat = wait_for_heartbeat(
+                ipc / "heartbeat.json", addon_version, started
+            )
+            request_shutdown(ipc)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired as error:
+                raise SetupError(
+                    "Thunderbird did not exit after its clean shutdown request; "
+                    f"PID {process.pid} was not killed"
+                ) from error
+            if process.returncode:
+                raise SetupError(
+                    f"Thunderbird exited with status {process.returncode}; "
+                    f"inspect {log_path}"
+                )
+        except BaseException as error:
+            if "process" in locals() and process.poll() is None:
+                process.terminate()
+            if not wait_for_profile_stop(profile, 30):
+                raise SetupError(
+                    "Add-on verification failed and Thunderbird still owns the "
+                    f"profile. Launcher PID: {process.pid}; log: {log_path}; "
+                    f"profile was not rolled back: {error}"
+                ) from error
+            with profile_guard(profile):
+                atomic_bytes(
+                    prefs_path,
+                    original_prefs,
+                    stat.S_IMODE(prefs_path.stat().st_mode),
+                )
+                if original_xpi is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    atomic_bytes(destination, original_xpi, 0o600)
+            raise SetupError(
+                f"add-on verification failed; installation rolled back: {error}"
+            ) from error
+        print(f"Installed tbmail bridge {addon_version} for Thunderbird {version}")
+        print(f"Profile: {profile}")
+        print(f"XPI: {destination}")
+        if backup:
+            print(f"Backup: {backup}")
+        print(f"Profile identity: {heartbeat['profileId']}")
+        return 0
+    except (OSError, SetupError, subprocess.SubprocessError) as error:
+        print(f"setup-thunderbird-addon: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

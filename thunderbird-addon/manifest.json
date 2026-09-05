@@ -1,0 +1,24 @@
+{
+  "manifest_version": 2,
+  "name": "tbmail bridge",
+  "description": "Profile-local bridge for tbmail write operations",
+  "version": "0.2.1",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "tbmail-bridge@ckress.dev",
+      "strict_min_version": "140.0",
+      "strict_max_version": "140.*"
+    }
+  },
+  "experiment_apis": {
+    "TbmailBridge": {
+      "schema": "api/TbmailBridge/schema.json",
+      "parent": {
+        "scopes": ["addon_parent"],
+        "events": ["startup"],
+        "paths": [["TbmailBridge"]],
+        "script": "api/TbmailBridge/implementation.js"
+      }
+    }
+  }
+}
