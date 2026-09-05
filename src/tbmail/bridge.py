@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
+import math
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -65,7 +68,6 @@ class IpcPaths:
     heartbeat: Path
     last_sync: Path
     bridge_log: Path
-    launch_lock: Path
     thunderbird_log: Path
 
 
@@ -79,7 +81,6 @@ def ipc_paths(profile: Path) -> IpcPaths:
         heartbeat=root / "heartbeat.json",
         last_sync=root / "last-sync.json",
         bridge_log=root / "bridge.log",
-        launch_lock=root / "launch.lock",
         thunderbird_log=state_home / "tbmail" / "thunderbird.log",
     )
 
@@ -116,8 +117,9 @@ def _timestamp(value: object) -> float | None:
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except ValueError:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.timestamp() if parsed.tzinfo else None
+    except (ValueError, OverflowError):
         return None
 
 
@@ -172,12 +174,23 @@ def _profile_argument(command: tuple[str, ...], profile: Path) -> str:
     return str(profile)
 
 
-def _launch(command: tuple[str, ...], profile: Path, paths: IpcPaths) -> int:
+def _launch(
+    command: tuple[str, ...], profile: Path, paths: IpcPaths, token: str = ""
+) -> int:
     if not command:
         raise OSError("Thunderbird command is empty")
     if "--headless" not in command:
         raise OSError("Thunderbird command must include --headless")
     arguments = list(command)
+    environment = os.environ.copy()
+    environment["TBMAIL_STARTUP_TOKEN"] = token
+    environment["TBMAIL_SAFETY_DEADLINE"] = str(int((time.time() + 1800) * 1000))
+    if Path(command[0]).name == "flatpak":
+        index = arguments.index("run") + 1
+        arguments[index:index] = [
+            f"--env={key}={environment[key]}"
+            for key in ("TBMAIL_STARTUP_TOKEN", "TBMAIL_SAFETY_DEADLINE")
+        ]
     if any(
         argument in {"--profile", "-profile", "-P", "--ProfileManager"}
         for argument in arguments
@@ -199,7 +212,7 @@ def _launch(command: tuple[str, ...], profile: Path, paths: IpcPaths) -> int:
         return os.posix_spawnp(
             arguments[0],
             arguments,
-            os.environ.copy(),
+            environment,
             file_actions=file_actions,
             setsid=True,
         )
@@ -207,16 +220,236 @@ def _launch(command: tuple[str, ...], profile: Path, paths: IpcPaths) -> int:
         os.close(descriptor)
 
 
-def _acquire_launch_lock(paths: IpcPaths) -> int | None:
-    descriptor = os.open(paths.launch_lock, os.O_RDWR | os.O_CREAT, 0o600)
+def state_directory(profile: Path) -> Path:
+    home = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+    key = hashlib.sha256(os.fsencode(profile.resolve())).hexdigest()
+    return home / "tbmail" / key
+
+
+def process_identity(pid: int) -> dict[str, object]:
+    stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return {
+        "pid": pid,
+        "starttime": stat[19],
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+    }
+
+
+@contextmanager
+def profile_lock(profile: Path, timeout: float = 300):
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("--timeout must be positive")
+    directory = state_directory(profile)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    descriptor = os.open(
+        directory / "operation.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+    )
+    deadline = time.monotonic() + timeout
     try:
-        fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise BridgeError(
+                        "Timed out waiting for another tbmail operation",
+                        request_id="",
+                        status="busy",
+                    )
+                time.sleep(0.1)
+        # Never replace or unlink the lock inode. Metadata is advisory only.
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, json.dumps(process_identity(os.getpid())).encode())
+        yield
+    finally:
         os.close(descriptor)
-        return None
-    os.ftruncate(descriptor, 0)
-    os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
-    return descriptor
+
+
+def profile_active(profile: Path) -> bool:
+    descriptor = os.open(
+        profile / ".parentlock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        try:
+            fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+    finally:
+        os.close(descriptor)
+
+
+def _owner(profile: Path) -> dict[str, Any]:
+    try:
+        return _read_json(state_directory(profile) / "managed.json")
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _owned(profile: Path, paths: IpcPaths) -> bool:
+    if not _heartbeat_is_fresh(paths):
+        return False
+    heartbeat = _read_json(paths.heartbeat)
+    token = _owner(profile).get("token")
+    return bool(
+        token
+        and heartbeat.get("startupToken") == token
+        and heartbeat.get("headless") is True
+    )
+
+
+def _launcher_alive(owner: dict[str, Any]) -> bool:
+    identity = owner.get("launcher")
+    if identity is None:
+        pending_until = owner.get("pending_until")
+        return isinstance(pending_until, (int, float)) and time.time() < pending_until
+    if not isinstance(identity, dict) or not isinstance(identity.get("pid"), int):
+        return False
+    try:
+        try:
+            if os.waitpid(identity["pid"], os.WNOHANG)[0]:
+                return False
+        except ChildProcessError:
+            pass
+        if (
+            Path(f"/proc/{identity['pid']}/stat")
+            .read_text()
+            .rsplit(")", 1)[1]
+            .split()[0]
+            == "Z"
+        ):
+            return False
+        return process_identity(identity["pid"]) == identity
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
+def start(
+    profile: Path, command: tuple[str, ...], timeout: float = 60
+) -> dict[str, object]:
+    with profile_lock(profile, timeout):
+        paths = ipc_paths(profile)
+        _prepare_paths(paths)
+        if profile_active(profile):
+            managed = False
+            if _owned(profile, paths):
+                try:
+                    _, identity = execute_locked(
+                        profile, (), "identify", {}, min(timeout, 5)
+                    )
+                    managed = (
+                        identity.get("startupToken") == _owner(profile).get("token")
+                        and identity.get("headless") is True
+                    )
+                except BridgeError:
+                    pass
+            return {
+                "status": "already_running",
+                "managed": managed,
+                "message": "Existing Thunderbird left unchanged",
+            }
+        if _launcher_alive(_owner(profile)):
+            raise BridgeError(
+                "A managed launcher is still starting or exiting; "
+                "retry after 'tbmail stop'",
+                request_id="",
+                status="busy",
+                paths=paths,
+            )
+        owner_path = state_directory(profile) / "managed.json"
+        owner_path.unlink(missing_ok=True)
+        paths.heartbeat.unlink(missing_ok=True)
+        (paths.root / "drain.json").unlink(missing_ok=True)
+        token = uuid.uuid4().hex
+        # Retain a pending launch if the CLI dies between spawn and PID recording.
+        _atomic_json(
+            owner_path,
+            {"token": token, "launcher": None, "pending_until": time.time() + 1800},
+        )
+        try:
+            pid = _launch(command, profile, paths, token)
+        except OSError:
+            owner_path.unlink(missing_ok=True)
+            raise
+        try:
+            identity = process_identity(pid)
+        except FileNotFoundError:
+            identity = {"pid": pid, "starttime": None, "boot_id": None}
+        _atomic_json(owner_path, {"token": token, "launcher": identity})
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if _owned(profile, paths) and profile_active(profile):
+                return {
+                    "status": "started",
+                    "managed": True,
+                    "message": "Managed headless Thunderbird started; "
+                    "fixed 30-minute safety deadline",
+                }
+            time.sleep(0.1)
+        raise BridgeError(
+            "Thunderbird startup timed out; run 'tbmail stop' to clean up",
+            request_id="",
+            status="timeout",
+            paths=paths,
+        )
+
+
+def stop(profile: Path, timeout: float = 300) -> dict[str, object]:
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("--timeout must be positive")
+    paths = ipc_paths(profile)
+    owner = _owner(profile)
+    # Publish before waiting for the operation lock so active sync can drain.
+    if owner.get("token") and paths.root.is_dir():
+        _atomic_json(paths.root / "drain.json", {"startupToken": owner["token"]})
+    deadline = time.monotonic() + timeout
+    with profile_lock(profile, timeout):
+        while not profile_active(profile) and _launcher_alive(_owner(profile)):
+            if time.monotonic() >= deadline:
+                raise BridgeError(
+                    "Managed launcher has not released; retry 'tbmail stop'. "
+                    "No process was killed",
+                    request_id="",
+                    status="timeout",
+                    paths=paths,
+                )
+            time.sleep(0.1)
+        if not profile_active(profile):
+            (state_directory(profile) / "managed.json").unlink(missing_ok=True)
+            return {"status": "stopped", "managed": False}
+        while not _heartbeat_is_fresh(paths) and _launcher_alive(_owner(profile)):
+            if time.monotonic() >= deadline:
+                raise BridgeError(
+                    "Managed bridge has not responded; drain signal retained. "
+                    "Retry 'tbmail stop'",
+                    request_id="",
+                    status="timeout",
+                    paths=paths,
+                )
+            time.sleep(0.1)
+        if not _owned(profile, paths):
+            return {
+                "status": "not_owned",
+                "managed": False,
+                "message": "Unowned Thunderbird left unchanged",
+            }
+        # Recheck after the lock: a concurrent start may have changed the token.
+        _atomic_json(
+            paths.root / "drain.json", {"startupToken": _owner(profile)["token"]}
+        )
+        while time.monotonic() < deadline:
+            if not profile_active(profile):
+                (state_directory(profile) / "managed.json").unlink(missing_ok=True)
+                return {"status": "stopped", "managed": False}
+            time.sleep(0.1)
+        raise BridgeError(
+            "Thunderbird is still draining; no process was killed. Retry 'tbmail stop'",
+            request_id="",
+            status="timeout",
+            paths=paths,
+        )
 
 
 def execute(
@@ -226,13 +459,57 @@ def execute(
     payload: dict[str, object],
     timeout: float,
 ) -> tuple[str, dict[str, Any]]:
-    if timeout <= 0:
+    with profile_lock(profile, timeout):
+        return execute_locked(profile, command, operation, payload, timeout)
+
+
+def execute_locked(
+    profile: Path,
+    command: tuple[str, ...],
+    operation: str,
+    payload: dict[str, object],
+    timeout: float,
+) -> tuple[str, dict[str, Any]]:
+    if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("--timeout must be positive")
     deadline = time.monotonic() + timeout
     absolute_deadline = int((time.time() + timeout) * 1000)
     request_id = uuid.uuid4().hex
     paths = ipc_paths(profile)
     _prepare_paths(paths)
+    if not _heartbeat_is_fresh(paths) or not profile_active(profile):
+        raise BridgeError(
+            "No Thunderbird bridge instance is available. "
+            "Run 'tbmail start' and retry.",
+            request_id=request_id,
+            status="absent_instance",
+            paths=paths,
+        )
+    while operation != "identify" and _read_json(paths.heartbeat).get("active"):
+        if time.monotonic() >= deadline:
+            raise BridgeError(
+                "Previous Thunderbird operation is still draining",
+                request_id=request_id,
+                status="busy",
+                paths=paths,
+            )
+        time.sleep(0.1)
+        if not _heartbeat_is_fresh(paths):
+            raise BridgeError(
+                "No Thunderbird bridge instance is available. "
+                "Run 'tbmail start' and retry.",
+                request_id=request_id,
+                status="absent_instance",
+                paths=paths,
+            )
+    if operation != "identify" and _read_json(paths.heartbeat).get("draining"):
+        raise BridgeError(
+            "Thunderbird is stopping; wait for 'tbmail stop', "
+            "then run 'tbmail start' and retry",
+            request_id=request_id,
+            status="busy",
+            paths=paths,
+        )
     _cleanup_stale_files(paths)
     request = {
         "protocolVersion": PROTOCOL_VERSION,
@@ -245,20 +522,7 @@ def execute(
     response_path = paths.responses / f"{request_id}.json"
     _atomic_json(request_path, request)
 
-    launch_lock: int | None = None
     try:
-        if not _heartbeat_is_fresh(paths):
-            launch_lock = _acquire_launch_lock(paths)
-            if launch_lock is not None and not _heartbeat_is_fresh(paths):
-                try:
-                    _launch(command, profile, paths)
-                except OSError as exc:
-                    raise BridgeError(
-                        f"Could not launch Thunderbird: {exc}",
-                        request_id=request_id,
-                        paths=paths,
-                    ) from exc
-
         while time.monotonic() < deadline:
             try:
                 response = _read_json(response_path)
@@ -272,11 +536,6 @@ def execute(
                     status="invalid",
                     paths=paths,
                 ) from exc
-            finally:
-                if launch_lock is not None and _heartbeat_is_fresh(paths):
-                    os.close(launch_lock)
-                    launch_lock = None
-
             response_path.unlink(missing_ok=True)
             if response.get("protocolVersion") != PROTOCOL_VERSION:
                 raise BridgeError(
@@ -318,8 +577,6 @@ def execute(
         )
     finally:
         request_path.unlink(missing_ok=True)
-        if launch_lock is not None:
-            os.close(launch_lock)
 
 
 def stale_sync_warnings(
@@ -342,14 +599,62 @@ def stale_sync_warnings(
     warnings = []
     for account in accounts:
         timestamp = _timestamp(values.get(account.server_id))
-        if timestamp is None or timestamp > now + 60:
+        if timestamp is None or timestamp > now:
             warnings.append(
                 f"Local mail for {account.name} has never been synchronized"
             )
-        elif now - timestamp > max_age:
+        elif now - timestamp >= max_age:
             minutes = max(1, int((now - timestamp) // 60))
             warnings.append(
                 f"Local mail for {account.name} was last synchronized "
                 f"{minutes} minutes ago"
             )
     return warnings
+
+
+@dataclass
+class AccountFreshness:
+    account: str
+    server_key: str
+    needs_sync: bool
+    last_sync: str | None
+
+
+@dataclass
+class FreshnessResult:
+    needs_sync: bool
+    accounts: list[AccountFreshness]
+    message: str
+
+
+def sync_freshness(profile: Path, accounts: list[MailAccount]) -> FreshnessResult:
+    try:
+        state = _read_json(ipc_paths(profile).last_sync)
+    except (FileNotFoundError, ValueError):
+        state = {}
+    values = state.get("accounts", {})
+    if state.get("protocolVersion") != PROTOCOL_VERSION or not isinstance(values, dict):
+        values = {}
+    now = time.time()
+    results = []
+    for account in accounts:
+        raw = values.get(account.server_id)
+        timestamp = _timestamp(raw)
+        fresh = timestamp is not None and 0 <= now - timestamp < 300
+        results.append(
+            AccountFreshness(
+                account.name,
+                account.server_id,
+                not fresh,
+                raw if isinstance(raw, str) else None,
+            )
+        )
+    needs_sync = any(account.needs_sync for account in results)
+    return FreshnessResult(
+        needs_sync,
+        results,
+        "Synchronization needed"
+        if needs_sync
+        else "All selected accounts synchronized successfully "
+        "less than five minutes ago; sync skipped",
+    )

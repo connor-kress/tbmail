@@ -26,6 +26,8 @@ PROTOCOL_VERSION = 1
 REPOSITORY = Path(__file__).resolve().parents[1]
 SOURCE = REPOSITORY / "thunderbird-addon"
 TMP = REPOSITORY / "tmp" / "thunderbird-addon"
+sys.path.insert(0, str(REPOSITORY / "src"))
+from tbmail.bridge import BridgeError, profile_lock, start, stop  # noqa: E402
 
 
 class SetupError(RuntimeError):
@@ -236,17 +238,6 @@ def sandbox_profile_path(profile: Path) -> Path:
     return Path.home() / relative
 
 
-def atomic_json(path: Path, value: object) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    with temporary.open("w", encoding="utf-8") as file:
-        json.dump(value, file, separators=(",", ":"))
-        file.flush()
-        os.fsync(file.fileno())
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
-
-
 def wait_for_heartbeat(
     path: Path, addon_version: str, started: float
 ) -> dict[str, object]:
@@ -270,40 +261,6 @@ def wait_for_heartbeat(
             last_error = str(error)
         time.sleep(0.25)
     raise SetupError(f"add-on heartbeat verification timed out: {last_error}")
-
-
-def request_shutdown(ipc: Path) -> str:
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        request_id = f"setup-{uuid.uuid4().hex}"
-        request = ipc / "requests" / f"{request_id}.json"
-        response = ipc / "responses" / f"{request_id}.json"
-        atomic_json(
-            request,
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "requestId": request_id,
-                "operation": "shutdown",
-                "deadline": int((time.time() + 30) * 1000),
-            },
-        )
-        try:
-            while time.monotonic() < deadline:
-                try:
-                    value = json.loads(response.read_text(encoding="utf-8"))
-                    response.unlink(missing_ok=True)
-                    if value.get("status") == "success":
-                        return request_id
-                    if value.get("status") != "busy":
-                        raise SetupError(f"add-on refused clean shutdown: {value}")
-                    break
-                except FileNotFoundError:
-                    time.sleep(0.25)
-        finally:
-            request.unlink(missing_ok=True)
-            response.unlink(missing_ok=True)
-        time.sleep(0.25)
-    raise SetupError("clean shutdown request timed out")
 
 
 def cleanup_setup_queue(ipc: Path) -> None:
@@ -333,77 +290,53 @@ def main() -> int:
         version = flatpak_version()
         profile = discover_profile(arguments.profile)
         assert_profile_stopped(profile)
-        sandbox_profile = sandbox_profile_path(profile)
+        sandbox_profile_path(profile)
         manifest = addon_manifest()
         addon_version = str(manifest["version"])
         xpi = TMP / f"tbmail-bridge-{addon_version}.xpi"
         package_xpi(xpi)
-        prefs_path = profile / "prefs.js"
-        original_prefs = prefs_path.read_bytes()
         destination = profile / "extensions" / f"{ADDON_ID}.xpi"
-        original_xpi = destination.read_bytes() if destination.is_file() else None
         ipc = profile / "tbmail-ipc"
-        with profile_guard(profile):
+        with profile_lock(profile), profile_guard(profile):
+            original_xpi = destination.read_bytes() if destination.is_file() else None
             cleanup_setup_queue(ipc)
             allow_profile_sideload(profile)
             destination, backup = install_xpi(profile, xpi)
-        (ipc / "heartbeat.json").unlink(missing_ok=True)
-        log_path = TMP / "setup-thunderbird.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         started = time.time()
         try:
-            with log_path.open("ab") as output:
-                process = subprocess.Popen(
-                    [
-                        "flatpak",
-                        "run",
-                        APP_ID,
-                        "--headless",
-                        "--profile",
-                        str(sandbox_profile),
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
+            launched = start(profile, ("flatpak", "run", APP_ID, "--headless"))
+            if not launched["managed"]:
+                raise SetupError(
+                    "Another Thunderbird instance started during setup; left untouched"
                 )
             heartbeat = wait_for_heartbeat(
                 ipc / "heartbeat.json", addon_version, started
             )
-            request_shutdown(ipc)
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired as error:
+            if stop(profile)["status"] != "stopped":
                 raise SetupError(
-                    "Thunderbird did not exit after its clean shutdown request; "
-                    f"PID {process.pid} was not killed"
-                ) from error
-            if process.returncode:
-                raise SetupError(
-                    f"Thunderbird exited with status {process.returncode}; "
-                    f"inspect {log_path}"
+                    "Verification instance was not stopped; no process was killed"
                 )
         except BaseException as error:
-            if "process" in locals() and process.poll() is None:
-                process.terminate()
+            try:
+                stop(profile, 30)
+            except (BridgeError, OSError):
+                pass
             if not wait_for_profile_stop(profile, 30):
                 raise SetupError(
                     "Add-on verification failed and Thunderbird still owns the "
-                    f"profile. Launcher PID: {process.pid}; log: {log_path}; "
+                    "profile. No process was killed; "
                     f"profile was not rolled back: {error}"
                 ) from error
-            with profile_guard(profile):
-                atomic_bytes(
-                    prefs_path,
-                    original_prefs,
-                    stat.S_IMODE(prefs_path.stat().st_mode),
-                )
-                if original_xpi is None:
-                    destination.unlink(missing_ok=True)
-                else:
-                    atomic_bytes(destination, original_xpi, 0o600)
+            with profile_lock(profile), profile_guard(profile):
+                # Do not overwrite preferences saved by Thunderbird or external edits.
+                if destination.read_bytes() == xpi.read_bytes():
+                    if original_xpi is None:
+                        destination.unlink(missing_ok=True)
+                    else:
+                        atomic_bytes(destination, original_xpi, 0o600)
             raise SetupError(
-                f"add-on verification failed; installation rolled back: {error}"
+                f"add-on verification failed; unchanged XPI rolled back; "
+                f"sideload preferences retained: {error}"
             ) from error
         print(f"Installed tbmail bridge {addon_version} for Thunderbird {version}")
         print(f"Profile: {profile}")
@@ -412,7 +345,7 @@ def main() -> int:
             print(f"Backup: {backup}")
         print(f"Profile identity: {heartbeat['profileId']}")
         return 0
-    except (OSError, SetupError, subprocess.SubprocessError) as error:
+    except (OSError, SetupError, BridgeError, subprocess.SubprocessError) as error:
         print(f"setup-thunderbird-addon: {error}", file=sys.stderr)
         return 1
 

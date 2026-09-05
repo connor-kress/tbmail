@@ -18,7 +18,7 @@ from tbmail.index import (
     find_message,
     resolve_message_for_write,
 )
-from tbmail.profile import discover_accounts
+from tbmail.profile import MailAccount, discover_accounts
 
 
 class TbmailTestCase(unittest.TestCase):
@@ -47,6 +47,7 @@ class TbmailTestCase(unittest.TestCase):
             encoding="utf-8",
         )
         self.inbox = self.mail_directory / "INBOX"
+        self.inbox.with_suffix(".msf").touch()
         self.inbox.write_bytes(
             b"".join(
                 [
@@ -127,7 +128,10 @@ class TbmailTestCase(unittest.TestCase):
         self.parser = build_parser()
         self.environment = patch.dict(
             os.environ,
-            {"XDG_CACHE_HOME": str(self.root / "cache")},
+            {
+                "XDG_CACHE_HOME": str(self.root / "cache"),
+                "XDG_STATE_HOME": str(self.root / "state"),
+            },
         )
         self.environment.start()
         ipc = self.profile / "tbmail-ipc"
@@ -372,7 +376,9 @@ class TbmailTestCase(unittest.TestCase):
         with patch(
             "tbmail.cli.execute", return_value=("request-2", response)
         ) as execute:
-            result = run(self.parse("sync", "-a", "personal", "--timeout", "12"))
+            result = run(
+                self.parse("sync", "-a", "personal", "--force", "--timeout", "12")
+            )
 
         self.assertEqual(result.accounts[0].account, "personal")
         self.assertEqual(execute.call_args.args[3], {"serverKeys": ["server1"]})
@@ -399,6 +405,72 @@ class TbmailTestCase(unittest.TestCase):
             run(self.parse("accounts"))
 
         self.assertEqual(errors.getvalue(), "")
+
+    def test_sync_check_and_fresh_skip_do_not_contact_thunderbird(self) -> None:
+        with patch("tbmail.cli.execute") as execute:
+            for arguments in (("sync", "--check"), ("sync",)):
+                result = run(self.parse(*arguments))
+                self.assertFalse(result.needs_sync)
+            (self.profile / "tbmail-ipc/last-sync.json").unlink()
+            with patch("tbmail.cli.profile_lock") as lock:
+                result = run(self.parse("sync", "--check", "-a", "personal"))
+                self.assertTrue(result.needs_sync)
+                lock.assert_not_called()
+        execute.assert_not_called()
+
+    def test_check_and_force_are_exclusive(self) -> None:
+        with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+            self.parse("sync", "--check", "--force")
+
+    def test_mixed_sync_only_schedules_stale_accounts(self) -> None:
+        accounts = discover_accounts(self.profile, load_config(self.config))
+        accounts.append(
+            MailAccount(
+                "other@example.com",
+                "example.com",
+                self.mail_directory,
+                "server2",
+                "other",
+            )
+        )
+        response = {
+            "accounts": [{"serverKey": "server2", "status": "success", "folders": []}]
+        }
+        with (
+            patch("tbmail.cli.discover_accounts", return_value=accounts),
+            patch("tbmail.cli.execute", return_value=("request", response)) as execute,
+        ):
+            result = run(
+                self.parse(
+                    "sync",
+                    "--account-raw",
+                    "person@example.com",
+                    "--account-raw",
+                    "other@example.com",
+                )
+            )
+        self.assertEqual(execute.call_args.args[3], {"serverKeys": ["server2"]})
+        self.assertEqual(
+            [account.status for account in result.accounts],
+            ["success", "skipped_fresh"],
+        )
+
+    def test_local_reads_do_not_acquire_lifecycle_lock(self) -> None:
+        with patch(
+            "tbmail.cli.profile_lock", side_effect=AssertionError("local read locked")
+        ):
+            run(self.parse("status"))
+            message = run(self.parse("search")).messages[0]
+            run(self.parse("show", message.public_id))
+
+    def test_search_defaults_to_all_downloaded_folders(self) -> None:
+        archive = self.mail_directory / "Archive"
+        archive.write_bytes(self.inbox.read_bytes())
+        archive.with_suffix(".msf").touch()
+        self.assertEqual(run(self.parse("search", "--count")).count, 4)
+        self.assertEqual(
+            run(self.parse("search", "--folder", "inbox", "--count")).count, 2
+        )
 
 
 if __name__ == "__main__":

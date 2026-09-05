@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "name": "tbmail bridge",
   "description": "Profile-local bridge for tbmail write operations",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "browser_specific_settings": {
     "gecko": {
       "id": "tbmail-bridge@ckress.dev",

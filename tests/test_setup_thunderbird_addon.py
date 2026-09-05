@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -129,6 +130,37 @@ class SetupThunderbirdAddonTestCase(unittest.TestCase):
             run.call_args.args[0],
             ["flatpak", "list", "--app", "--columns=application,version"],
         )
+
+    def test_failed_verification_keeps_external_changes_and_attempts_cleanup(
+        self,
+    ) -> None:
+        profile = self.root / "profile"
+        extensions = profile / "extensions"
+        extensions.mkdir(parents=True)
+        prefs = profile / "prefs.js"
+        prefs.write_text('user_pref("example", 1);\n')
+        destination = extensions / f"{setup.ADDON_ID}.xpi"
+        destination.write_bytes(b"original")
+
+        def failed_start(*args):
+            prefs.write_text('user_pref("external-change", 2);\n')
+            destination.write_bytes(b"external replacement")
+            raise setup.BridgeError("verification failed", request_id="")
+
+        with (
+            patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")}),
+            patch.object(setup, "parse_arguments", return_value=Mock(profile=profile)),
+            patch.object(setup, "flatpak_version", return_value="140.15.0esr"),
+            patch.object(setup, "sandbox_profile_path", return_value=profile),
+            patch.object(setup, "TMP", self.root / "tmp"),
+            patch.object(setup, "start", side_effect=failed_start),
+            patch.object(setup, "stop") as stop,
+            patch("sys.stderr", new=io.StringIO()),
+        ):
+            self.assertEqual(setup.main(), 1)
+        stop.assert_called_once_with(profile, 30)
+        self.assertEqual(destination.read_bytes(), b"external replacement")
+        self.assertIn("external-change", prefs.read_text())
 
 
 if __name__ == "__main__":

@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 import sys
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .bridge import BridgeError, execute, stale_sync_warnings
-from .config import ConfigError, load_config
+from .bridge import (
+    BridgeError,
+    FreshnessResult,
+    profile_lock,
+    stale_sync_warnings,
+    start,
+    stop,
+    sync_freshness,
+)
+from .bridge import (
+    execute_locked as execute,
+)
+from .config import Config, ConfigError, load_config
 from .index import (
     MessageContent,
     count_messages,
@@ -26,7 +38,9 @@ from .profile import (
     ProfileError,
     discover_accounts,
     discover_profile,
+    downloaded_folders,
     folder_counts,
+    folder_name,
     resolve_folder,
     select_accounts,
 )
@@ -133,6 +147,8 @@ CommandResult = (
     | MessageContent
     | SyncResult
     | MarkResult
+    | FreshnessResult
+    | dict[str, object]
 )
 
 
@@ -162,18 +178,23 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("accounts", help="list discovered IMAP accounts")
+    for command in ("start", "stop"):
+        lifecycle = subparsers.add_parser(
+            command, help=f"{command} managed headless Thunderbird"
+        )
+        lifecycle.add_argument("--timeout", type=float, default=300)
 
     status = subparsers.add_parser("status", help="show folder message status")
     _account_arguments(status)
     status.add_argument(
-        "--folder", default="inbox", help="folder name (default: inbox)"
+        "--folder", help="restrict to a folder (default: all downloaded folders)"
     )
 
     search = subparsers.add_parser("search", help="search downloaded message headers")
     _account_arguments(search)
     search.add_argument("query", nargs="?", help="text in subject or address headers")
     search.add_argument(
-        "--folder", default="inbox", help="folder name (default: inbox)"
+        "--folder", help="restrict to a folder (default: all downloaded folders)"
     )
     search.add_argument("--from", dest="sender", help="sender text")
     search.add_argument("--subject", help="subject text")
@@ -200,6 +221,17 @@ def build_parser() -> argparse.ArgumentParser:
         "sync", help="refresh Thunderbird and download all message bodies"
     )
     _account_arguments(sync)
+    freshness = sync.add_mutually_exclusive_group()
+    freshness.add_argument(
+        "--check",
+        action="store_true",
+        help="check per-account freshness locally; exit zero for fresh or stale",
+    )
+    freshness.add_argument(
+        "--force",
+        action="store_true",
+        help="sync even when selected accounts are fresh",
+    )
     sync.add_argument(
         "--timeout",
         type=float,
@@ -314,6 +346,19 @@ def _sync_result(
 def run(args: argparse.Namespace) -> CommandResult:
     config = load_config(args.config)
     profile = discover_profile(args.profile)
+    if args.command == "start":
+        return start(profile, config.thunderbird_command, args.timeout)
+    if args.command == "stop":
+        return stop(profile, args.timeout)
+    if args.command in {"mark-read", "mark-unread"} or (
+        args.command == "sync" and not args.check
+    ):
+        with profile_lock(profile, getattr(args, "timeout", 300)):
+            return _run(args, config, profile)
+    return _run(args, config, profile)
+
+
+def _run(args: argparse.Namespace, config: Config, profile: Path) -> CommandResult:
     accounts = discover_accounts(profile, config)
 
     if args.command == "accounts":
@@ -389,8 +434,19 @@ def run(args: argparse.Namespace) -> CommandResult:
     selected = select_accounts(accounts, config, args.account, args.account_raw)
 
     if args.command == "sync":
-        if args.timeout <= 0:
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise ValueError("--timeout must be positive")
+        freshness = sync_freshness(profile, selected)
+        if args.check or (not args.force and not freshness.needs_sync):
+            return freshness
+        skipped = [account for account in freshness.accounts if not account.needs_sync]
+        if not args.force:
+            stale = {
+                account.server_key
+                for account in freshness.accounts
+                if account.needs_sync
+            }
+            selected = [account for account in selected if account.server_id in stale]
         request_id, response = execute(
             profile,
             config.thunderbird_command,
@@ -398,10 +454,31 @@ def run(args: argparse.Namespace) -> CommandResult:
             {"serverKeys": [account.server_id for account in selected]},
             args.timeout,
         )
-        return _sync_result(request_id, response, selected, config.aliases)
+        result = _sync_result(request_id, response, selected, config.aliases)
+        if not args.force:
+            for account in skipped:
+                original = next(
+                    item for item in accounts if item.server_id == account.server_key
+                )
+                result.accounts.append(
+                    AccountSyncResult(
+                        account.account,
+                        original.email,
+                        account.server_key,
+                        "skipped_fresh",
+                        [],
+                    )
+                )
+        return result
 
     accounts_and_folders = [
-        (account, resolve_folder(account, args.folder)) for account in selected
+        (account, folder)
+        for account in selected
+        for folder in (
+            [resolve_folder(account, args.folder)]
+            if args.folder
+            else downloaded_folders(account)
+        )
     ]
 
     if args.command == "status":
@@ -413,7 +490,7 @@ def run(args: argparse.Namespace) -> CommandResult:
                 FolderResult(
                     account=account.name,
                     email=account.email,
-                    folder=args.folder,
+                    folder=folder_name(account, folder),
                     total=counts.total,
                     unread=counts.unread,
                     server_total=counts.server_total,
@@ -464,7 +541,14 @@ def run(args: argparse.Namespace) -> CommandResult:
             MessageResult(
                 public_id=message.public_id,
                 account=_account_name(message.account_email, config.aliases),
-                folder=args.folder,
+                folder=folder_name(
+                    next(
+                        account
+                        for account in selected
+                        if account.email.casefold() == message.account_email.casefold()
+                    ),
+                    message.folder_path,
+                ),
                 message_id=message.message_id,
                 subject=message.subject,
                 sender=message.sender,

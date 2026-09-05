@@ -247,6 +247,25 @@ def resolve_folder(account: MailAccount, folder_name: str) -> Path:
     return folder
 
 
+def downloaded_folders(account: MailAccount) -> list[Path]:
+    folders = []
+    for summary in sorted(account.directory.rglob("*.msf")):
+        folder = summary.with_suffix("")
+        relative = folder.relative_to(account.directory)
+        if (
+            all(part.endswith(".sbd") for part in relative.parts[:-1])
+            and folder.is_file()
+        ):
+            folder.resolve().relative_to(account.directory.resolve())
+            folders.append(folder)
+    return folders
+
+
+def folder_name(account: MailAccount, folder: Path) -> str:
+    parts = folder.relative_to(account.directory).parts
+    return "/".join([part.removesuffix(".sbd") for part in parts[:-1]] + [parts[-1]])
+
+
 def folder_counts(profile: Path, folder: Path) -> FolderCounts:
     cache_path = profile / "folderCache.json"
     try:

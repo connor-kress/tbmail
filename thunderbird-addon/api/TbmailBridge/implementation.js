@@ -5,7 +5,7 @@
 const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 300;
 const HEARTBEAT_INTERVAL_MS = 2000;
-const IDLE_SHUTDOWN_MS = 5 * 60 * 1000;
+const SAFETY_SHUTDOWN_MS = 30 * 60 * 1000;
 const STALE_AGE_MS = 24 * 60 * 60 * 1000;
 const LOG_LIMIT_BYTES = 5 * 1024 * 1024;
 const LOG_BACKUPS = 3;
@@ -23,7 +23,7 @@ function errorDetails(error) {
       typeof error?.result == "number"
         ? `0x${(error.result >>> 0).toString(16)}`
         : undefined,
-    stack: error?.stack,
+    stack: error?.stack
   };
 }
 
@@ -49,6 +49,21 @@ class Bridge {
     this.heartbeatTimer = null;
     this.idleTimer = null;
     this.logging = Promise.resolve();
+    this.startupToken = Services.env.get("TBMAIL_STARTUP_TOKEN");
+    this.managed =
+      this.isHeadless() && /^[a-f0-9]{32}$/.test(this.startupToken);
+    const requestedDeadline = Number(
+      Services.env.get("TBMAIL_SAFETY_DEADLINE")
+    );
+    this.safetyDeadline = this.managed
+      ? Math.min(
+          Date.now() + SAFETY_SHUTDOWN_MS,
+          requestedDeadline || Date.now()
+        )
+      : null;
+    this.draining = false;
+    this.polling = false;
+    this.lastQuitAttempt = 0;
   }
 
   async start() {
@@ -61,16 +76,21 @@ class Bridge {
     await this.cleanupStaleFiles();
     await this.log("startup", {
       thunderbirdVersion: Services.appinfo.version,
-      headless: this.isHeadless(),
+      headless: this.isHeadless()
     });
     await this.writeHeartbeat();
-    this.pollTimer = setInterval(() => this.poll().catch(error => {
-      this.log("poll-error", { error: errorDetails(error) });
-    }), POLL_INTERVAL_MS);
+    this.pollTimer = setInterval(
+      () =>
+        this.poll().catch(error => {
+          this.log("poll-error", { error: errorDetails(error) });
+        }),
+      POLL_INTERVAL_MS
+    );
     this.heartbeatTimer = setInterval(
-      () => this.writeHeartbeat().catch(error => {
-        this.log("heartbeat-error", { error: errorDetails(error) });
-      }),
+      () =>
+        this.writeHeartbeat().catch(error => {
+          this.log("heartbeat-error", { error: errorDetails(error) });
+        }),
       HEARTBEAT_INTERVAL_MS
     );
     this.resetIdleTimer();
@@ -92,19 +112,24 @@ class Bridge {
   }
 
   resetIdleTimer() {
-    clearTimeout(this.idleTimer);
-    if (!this.isHeadless()) {
+    if (!this.managed || this.idleTimer) {
       return;
     }
-    this.idleTimer = setTimeout(() => this.onIdle(), IDLE_SHUTDOWN_MS);
+    this.idleTimer = setTimeout(
+      () => this.onIdle(),
+      Math.max(0, this.safetyDeadline - Date.now())
+    );
   }
 
   async onIdle() {
+    this.draining = true;
     if (this.active) {
-      this.resetIdleTimer();
       return;
     }
-    await this.stop("headless-idle-timeout");
+    if (Date.now() - this.lastQuitAttempt < 1000) return;
+    this.lastQuitAttempt = Date.now();
+    await this.log("managed-quit-requested");
+    // Keep polling until application shutdown, in case a quit observer cancels.
     Services.startup.quit(Ci.nsIAppStartup.eAttemptQuit);
   }
 
@@ -144,6 +169,9 @@ class Bridge {
       operation: this.active?.operation || null,
       requestId: this.active?.requestId || null,
       headless: this.isHeadless(),
+      startupToken: this.managed ? this.startupToken : null,
+      safetyDeadline: this.safetyDeadline,
+      draining: this.draining
     });
   }
 
@@ -151,7 +179,7 @@ class Bridge {
     const entry = `${JSON.stringify({
       timestamp: new Date().toISOString(),
       event,
-      ...fields,
+      ...fields
     })}\n`;
     this.logging = this.logging
       .then(async () => {
@@ -167,7 +195,7 @@ class Bridge {
         // unit is a safe UTF-8 upper bound in this privileged scope.
         if (size + entry.length * 4 > LOG_LIMIT_BYTES) {
           await IOUtils.remove(`${this.logPath}.${LOG_BACKUPS}`, {
-            ignoreAbsent: true,
+            ignoreAbsent: true
           });
           for (let index = LOG_BACKUPS - 1; index >= 1; index--) {
             const source = `${this.logPath}.${index}`;
@@ -179,7 +207,9 @@ class Bridge {
             await IOUtils.move(this.logPath, `${this.logPath}.1`);
           }
         }
-        await IOUtils.writeUTF8(this.logPath, entry, { mode: "appendOrCreate" });
+        await IOUtils.writeUTF8(this.logPath, entry, {
+          mode: "appendOrCreate"
+        });
         await IOUtils.setPermissions(this.logPath, 0o600, false);
       })
       .catch(error => Cu.reportError(error));
@@ -196,7 +226,7 @@ class Bridge {
             await IOUtils.remove(path);
             await this.log("stale-file-removed", {
               queue: PathUtils.filename(directory),
-              file: PathUtils.filename(path),
+              file: PathUtils.filename(path)
             });
           }
         } catch (error) {
@@ -209,45 +239,80 @@ class Bridge {
   }
 
   async poll() {
-    if (this.stopped) {
+    if (this.stopped || this.polling) {
       return;
     }
-    const paths = (await IOUtils.getChildren(this.requests))
-      .filter(path => PathUtils.filename(path).endsWith(".json"))
-      .sort();
-    for (const path of paths) {
-      const claimed = `${path}.processing-${Services.uuid.generateUUID()}`;
-      try {
-        await IOUtils.move(path, claimed, { noOverwrite: true });
-      } catch (error) {
-        if (["NotFoundError", "NoModificationAllowedError"].includes(error.name)) {
+    this.polling = true;
+    try {
+      if (this.managed) {
+        try {
+          const drain = await IOUtils.readJSON(
+            PathUtils.join(this.root, "drain.json")
+          );
+          if (drain.startupToken == this.startupToken) {
+            this.draining = true;
+          }
+        } catch (error) {
+          if (error.name != "NotFoundError") {
+            await this.log("drain-read-error", { error: errorDetails(error) });
+          }
+        }
+        if (Date.now() >= this.safetyDeadline) this.draining = true;
+      }
+      if (this.draining) {
+        if (!this.active) await this.onIdle();
+        return;
+      }
+      const paths = (await IOUtils.getChildren(this.requests))
+        .filter(path => PathUtils.filename(path).endsWith(".json"))
+        .sort();
+      for (const path of paths) {
+        if (this.draining || this.stopped) break;
+        const claimed = `${path}.processing-${Services.uuid.generateUUID()}`;
+        try {
+          await IOUtils.move(path, claimed, { noOverwrite: true });
+        } catch (error) {
+          if (
+            ["NotFoundError", "NoModificationAllowedError"].includes(error.name)
+          ) {
+            continue;
+          }
+          throw error;
+        }
+        let request;
+        try {
+          request = await IOUtils.readJSON(claimed);
+        } catch (error) {
+          await this.finishInvalid(claimed, null, "Request is not valid JSON");
           continue;
         }
-        throw error;
-      }
-      let request;
-      try {
-        request = await IOUtils.readJSON(claimed);
-      } catch (error) {
-        await this.finishInvalid(claimed, null, "Request is not valid JSON");
-        continue;
-      }
-      if (this.active) {
-        await this.writeResponse(request, "busy", {
-          error: "Another operation is active",
-          activeRequestId: this.active.requestId,
+        if (request.operation == "identify" && !this.validateRequest(request)) {
+          await this.writeResponse(request, "success", {
+            startupToken: this.managed ? this.startupToken : null,
+            headless: this.isHeadless()
+          });
+          await IOUtils.remove(claimed);
+          continue;
+        }
+        if (this.active) {
+          await this.writeResponse(request, "busy", {
+            error: "Another operation is active",
+            activeRequestId: this.active.requestId
+          });
+          await IOUtils.remove(claimed);
+          continue;
+        }
+        this.active = {
+          requestId: request?.requestId,
+          operation: request?.operation
+        };
+        await this.writeHeartbeat();
+        this.handleClaimed(claimed, request).catch(error => {
+          Cu.reportError(error);
         });
-        await IOUtils.remove(claimed);
-        continue;
       }
-      this.active = {
-        requestId: request?.requestId,
-        operation: request?.operation,
-      };
-      await this.writeHeartbeat();
-      this.handleClaimed(claimed, request).catch(error => {
-        Cu.reportError(error);
-      });
+    } finally {
+      this.polling = false;
     }
   }
 
@@ -261,7 +326,11 @@ class Bridge {
     if (!/^[A-Za-z0-9._-]{1,128}$/.test(request.requestId || "")) {
       return "Invalid request ID";
     }
-    if (!["sync", "mark-read", "mark-unread", "shutdown"].includes(request.operation)) {
+    if (
+      !["sync", "mark-read", "mark-unread", "shutdown", "identify"].includes(
+        request.operation
+      )
+    ) {
       return "Invalid operation";
     }
     if (!Number.isFinite(request.deadline) || request.deadline <= 0) {
@@ -283,7 +352,7 @@ class Bridge {
       await this.log("request-start", { requestId, operation });
       if (Date.now() >= request.deadline) {
         await this.writeResponse(request, "timeout", {
-          error: "Request deadline expired before processing",
+          error: "Request deadline expired before processing"
         });
         return;
       }
@@ -300,26 +369,27 @@ class Bridge {
       await this.log("request-result", {
         requestId,
         operation,
-        status: result.status,
+        status: result.status
       });
       await settle;
       if (result.quit) {
-        await this.stop("setup-request");
-        Services.startup.quit(Ci.nsIAppStartup.eAttemptQuit);
+        this.draining = true;
       }
     } catch (error) {
-      await this.writeResponse(request, "error", { error: errorDetails(error) });
+      await this.writeResponse(request, "error", {
+        error: errorDetails(error)
+      });
       await this.log("request-error", {
         requestId,
         operation,
-        error: errorDetails(error),
+        error: errorDetails(error)
       });
     } finally {
       await IOUtils.remove(path, { ignoreAbsent: true });
       await settle.catch(() => {});
       this.active = null;
       await this.writeHeartbeat().catch(() => {});
-      this.resetIdleTimer();
+      if (this.draining && !this.stopped) await this.onIdle();
     }
   }
 
@@ -334,20 +404,26 @@ class Bridge {
       await this.log("invalid-request-without-response", { status, body });
       return;
     }
-    await this.atomicWriteJSON(PathUtils.join(this.responses, `${requestId}.json`), {
-      protocolVersion: PROTOCOL_VERSION,
-      requestId,
-      status,
-      timestamp: new Date().toISOString(),
-      ...body,
-    });
+    await this.atomicWriteJSON(
+      PathUtils.join(this.responses, `${requestId}.json`),
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId,
+        status,
+        timestamp: new Date().toISOString(),
+        ...body
+      }
+    );
   }
 
   async shutdown(request) {
-    if (!this.isHeadless()) {
+    if (!this.managed || request.startupToken != this.startupToken) {
       return {
         status: "invalid",
-        body: { error: "Refusing to close a non-headless Thunderbird process" },
+        body: {
+          error:
+            "Refusing to close Thunderbird without managed headless ownership"
+        }
       };
     }
     return { status: "success", body: { shutdownRequested: true }, quit: true };
@@ -406,7 +482,7 @@ class Bridge {
         OnStartRunningUrl() {},
         OnStopRunningUrl(_url, status) {
           complete({ ok: Components.isSuccessCode(status), status });
-        },
+        }
       };
       if (phase != "download") {
         folderListener = {
@@ -423,7 +499,7 @@ class Bridge {
             if (changedFolder == folder && event == "FolderLoaded") {
               complete({ ok: true, completedBy: "folder-event" });
             }
-          },
+          }
         };
         folder.AddFolderListener(folderListener);
       }
@@ -433,15 +509,22 @@ class Bridge {
         complete({ ok: false, error });
         return;
       }
-      timeout = setTimeout(() => {
-        finish({ ok: false, timedOut: true, completion });
-      }, Math.max(0, deadline - Date.now()));
+      timeout = setTimeout(
+        () => {
+          finish({ ok: false, timedOut: true, completion });
+        },
+        Math.max(0, deadline - Date.now())
+      );
     });
     return operation;
   }
 
   async runFolder(folder, phase, deadline) {
-    if (Date.now() >= deadline) {
+    if (
+      this.draining ||
+      Date.now() >= deadline ||
+      (this.managed && Date.now() >= this.safetyDeadline)
+    ) {
       return { ok: false, timedOut: true, completion: Promise.resolve() };
     }
     await this.log("folder-start", { phase, folder: folder.URI });
@@ -452,10 +535,9 @@ class Bridge {
         if (phase == "download") {
           folder.downloadAllForOffline(listener, null);
         } else {
-          folder.QueryInterface(Ci.nsIMsgImapMailFolder).updateFolderWithListener(
-            null,
-            listener
-          );
+          folder
+            .QueryInterface(Ci.nsIMsgImapMailFolder)
+            .updateFolderWithListener(null, listener);
         }
       },
       deadline
@@ -463,42 +545,43 @@ class Bridge {
     await this.log("folder-result", {
       phase,
       folder: folder.URI,
-      status: result.timedOut
-        ? "timeout"
-        : result.ok
-          ? "success"
-          : "error",
+      status: result.timedOut ? "timeout" : result.ok ? "success" : "error",
       result: result.status,
-      error: result.error ? errorDetails(result.error) : undefined,
+      error: result.error ? errorDetails(result.error) : undefined
     });
     return result;
   }
 
   async sync(request) {
     if (!Array.isArray(request.serverKeys) || !request.serverKeys.length) {
-      return { status: "invalid", body: { error: "serverKeys must be non-empty" } };
+      return {
+        status: "invalid",
+        body: { error: "serverKeys must be non-empty" }
+      };
     }
     const accounts = [];
     const pending = [];
     let timedOut = false;
     for (const serverKey of request.serverKeys) {
-      if (timedOut || Date.now() >= request.deadline) {
+      if (this.draining || timedOut || Date.now() >= request.deadline) {
         timedOut = true;
         const accountResult = {
           serverKey,
           status: "not_started",
           folders: [],
-          incompletePhases: ["refresh-1", "refresh-2", "download"],
+          incompletePhases: ["refresh-1", "refresh-2", "download"]
         };
         try {
           const account = this.getAccount(serverKey);
           for (const phase of accountResult.incompletePhases) {
             accountResult.folders.push(
-              ...this.selectableFolders(account, phase == "download").map(folder => ({
-                uri: folder.URI,
-                phase,
-                status: "not_started",
-              }))
+              ...this.selectableFolders(account, phase == "download").map(
+                folder => ({
+                  uri: folder.URI,
+                  phase,
+                  status: "not_started"
+                })
+              )
             );
           }
         } catch (error) {
@@ -518,11 +601,17 @@ class Bridge {
               timedOut = true;
               break;
             }
-            await new Promise(resolve => setTimeout(resolve, Math.min(1000, remaining)));
+            await new Promise(resolve =>
+              setTimeout(resolve, Math.min(1000, remaining))
+            );
           }
           const folders = this.selectableFolders(account, phase == "download");
           for (const [folderIndex, folder] of folders.entries()) {
-            const result = await this.runFolder(folder, phase, request.deadline);
+            const result = await this.runFolder(
+              folder,
+              phase,
+              request.deadline
+            );
             accountResult.folders.push({
               uri: folder.URI,
               phase,
@@ -535,7 +624,7 @@ class Bridge {
                 typeof result.status == "number"
                   ? `0x${(result.status >>> 0).toString(16)}`
                   : undefined,
-              error: result.error ? errorDetails(result.error) : undefined,
+              error: result.error ? errorDetails(result.error) : undefined
             });
             if (result.timedOut) {
               pending.push(result.completion);
@@ -543,13 +632,13 @@ class Bridge {
                 ...folders.slice(folderIndex + 1).map(incomplete => ({
                   uri: incomplete.URI,
                   phase,
-                  status: "incomplete",
+                  status: "incomplete"
                 }))
               );
               accountResult.incompletePhases = [
-                ...(["refresh-1", "refresh-2", "download"].slice(
+                ...["refresh-1", "refresh-2", "download"].slice(
                   ["refresh-1", "refresh-2", "download"].indexOf(phase) + 1
-                )),
+                )
               ];
               for (const incompletePhase of accountResult.incompletePhases) {
                 accountResult.folders.push(
@@ -559,7 +648,7 @@ class Bridge {
                   ).map(incomplete => ({
                     uri: incomplete.URI,
                     phase: incompletePhase,
-                    status: "incomplete",
+                    status: "incomplete"
                   }))
                 );
               }
@@ -588,7 +677,7 @@ class Bridge {
     return {
       status: timedOut ? "timeout" : failed ? "partial" : "success",
       body: { accounts },
-      settle: Promise.allSettled(pending),
+      settle: Promise.allSettled(pending)
     };
   }
 
@@ -625,7 +714,10 @@ class Bridge {
       candidate => candidate.filePath.path == expectedPath
     );
     if (matches.length != 1) {
-      return { status: "error", body: { error: "Folder not found in account" } };
+      return {
+        status: "error",
+        body: { error: "Folder not found in account" }
+      };
     }
     const [folder] = matches;
     folder.msgDatabase;
@@ -658,14 +750,14 @@ class Bridge {
             idMatches.length == 0
               ? "Message not found"
               : "Message-ID is ambiguous in the folder",
-          messageIdMatches: idMatches.length,
-        },
+          messageIdMatches: idMatches.length
+        }
       };
     }
     if (Date.now() >= request.deadline) {
       return {
         status: "timeout",
-        body: { error: "Request deadline expired before applying the change" },
+        body: { error: "Request deadline expired before applying the change" }
       };
     }
     folder.markMessagesRead([header], desiredRead);
@@ -675,8 +767,8 @@ class Bridge {
         read: desiredRead,
         matchedBy,
         folderUri: folder.URI,
-        messageKey: header.messageKey,
-      },
+        messageKey: header.messageKey
+      }
     };
   }
 }
